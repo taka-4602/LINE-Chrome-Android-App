@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- Must track DarkColorScheme.background in ui/theme/Color.kt, otherwise
-         the window flashes a different shade before Compose draws. -->
-    <color name="background">#FF101410</color>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
-</resources>
