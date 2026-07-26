@@ -1,0 +1,5 @@
+<resources>
+    <!-- Shown under the launcher icon, so it is the app's display name rather
+         than the Gradle module name. -->
+    <string name="app_name">LINE Chrome</string>
+</resources>
