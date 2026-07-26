@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Downloaded attachments only.  Nothing else in filesDir is shared —
+         .e2eeKeys in particular must never leave the app. -->
+    <files-path
+        name="media"
+        path="media/" />
+</paths>
