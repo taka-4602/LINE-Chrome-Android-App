@@ -20,6 +20,7 @@ import com.taka4602.line_chrome.line.Operation
 import com.taka4602.line_chrome.line.Profile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -54,6 +55,14 @@ object LineRepository {
 
     /** Treat a recovery this recent as still good, rather than logging in again. */
     private const val RECOVERY_GRACE_MS = 30_000L
+
+    /**
+     * Pacing for the forced re-login below.  It doubles up to the ceiling, so a
+     * network that stays down costs a handful of attempts an hour rather than a
+     * login storm — LINE flags accounts for the latter.
+     */
+    private const val RELOGIN_RETRY_MS = 15_000L
+    private const val RELOGIN_RETRY_MAX_MS = 5 * 60_000L
 
     /** Uploads are buffered whole in memory, so cap what we will attempt. */
     private const val MAX_IMAGE_BYTES = 25 * 1_000_000
@@ -279,10 +288,21 @@ object LineRepository {
     private val sessionMutex = Mutex()
     private var lastRecoveryAt = 0L
     private var lastRecoveryOk = false
+    private var reloginJob: Job? = null
 
     /** LINE's V3_TOKEN_CLIENT_LOGGED_OUT — the session is gone, not the request. */
     private val LineServiceError.isSessionDead: Boolean
         get() = code == 8 || message.contains("LOGGED_OUT") || message.contains("V3_TOKEN")
+
+    /**
+     * Whether a failed re-login is worth repeating.
+     *
+     * A rejected password is the user's problem and no amount of retrying will
+     * fix it.  Everything else — no network, a timeout, LINE having a bad minute
+     * — is temporary by nature.
+     */
+    private val Exception.needsTheUser: Boolean
+        get() = this is LineServiceError && code == 1
 
     /**
      * Put a dead session back together without involving the user.
@@ -333,12 +353,14 @@ object LineRepository {
             return@withLock recorded(false)
         }
 
+        var pinAsked = false
         return@withLock try {
             val c = newClient()
             withContext(Dispatchers.IO) {
                 c.loginWithEmail(email, password, randomPin()) {
                     // Only reachable if the device certificate is gone, in
                     // which case this genuinely needs the user.
+                    pinAsked = true
                     _auth.value = AuthState.PinRequired(it)
                 }
                 c.verifyLogin()
@@ -348,8 +370,24 @@ object LineRepository {
             Log.i(TAG, "re-logged in with stored credentials")
             recorded(true)
         } catch (e: Exception) {
-            Log.w(TAG, "automatic re-login failed", e)
-            _auth.value = AuthState.Failed(e.messageForUser())
+            // Failing to reach LINE is not the same as being logged out of it,
+            // and answering the first with Failed strands the app: that stops
+            // the poller, and the poller is the only thing that would have
+            // retried.  One badly-timed blip during a token refresh would park
+            // us on the login screen until a human noticed — which is the exact
+            // outcome this setting exists to prevent.
+            if (pinAsked || e.needsTheUser) {
+                Log.w(TAG, "automatic re-login needs the user", e)
+                _auth.value = AuthState.Failed(e.messageForUser())
+            } else {
+                Log.w(TAG, "automatic re-login failed; retrying in the background", e)
+                // Do not tear the session down over this.  Signed in, the UI
+                // keeps its screen and its cached messages while the retry runs
+                // underneath; only a session that never got established has
+                // anything to show for the failure.
+                if (_auth.value !is AuthState.LoggedIn) _auth.value = AuthState.Connecting
+                startReloginWatchdog()
+            }
             recorded(false)
         }
     }
@@ -358,6 +396,35 @@ object LineRepository {
         lastRecoveryAt = System.currentTimeMillis()
         lastRecoveryOk = success
         return success
+    }
+
+    /**
+     * Keep forcing a re-login for as long as the stored password is still
+     * believed good.
+     *
+     * [recoverSession] only ever runs because some caller wanted a request to
+     * succeed; nothing in the app retries a dead session on its own once the
+     * poller has been stopped.  This is that missing loop, and it gives up only
+     * when it succeeds, when the credentials go away, or when LINE says
+     * something only the user can answer.
+     */
+    private fun startReloginWatchdog() {
+        if (reloginJob?.isActive == true) return
+        reloginJob = scope.launch {
+            var wait = RELOGIN_RETRY_MS
+            while (true) {
+                delay(wait)
+                if (_auth.value is AuthState.LoggedIn) return@launch
+                if (!session.autoReloginEnabled || !credentials.hasCredentials) return@launch
+                // This *is* the paced retry the grace window exists to enforce,
+                // so do not let the cached refusal answer on its behalf.
+                lastRecoveryAt = 0L
+                if (recoverSession()) return@launch
+                // recoverSession decided the user is needed after all.
+                if (_auth.value is AuthState.Failed) return@launch
+                wait = (wait * 2).coerceAtMost(RELOGIN_RETRY_MAX_MS)
+            }
+        }
     }
 
     /**
@@ -402,6 +469,9 @@ object LineRepository {
 
     fun logout() {
         scope.launch {
+            // Before anything else: a retry in flight would sign us straight
+            // back in with credentials this is about to clear.
+            reloginJob?.cancel()
             runCatching { client?.logout() }
             client = null
             session.clear()
@@ -465,7 +535,6 @@ object LineRepository {
     private suspend fun buildSummaries(
         c: LineClient,
     ): List<Pair<ChatSummary, Message>> = coroutineScopeIO {
-        val previousLastIds = _chats.value.associate { it.chatMid to it.lastMessage?.id }
         val names = LinkedHashMap<String, String>()
         val types = LinkedHashMap<String, Int?>()
         val pics = LinkedHashMap<String, String?>()
@@ -514,14 +583,36 @@ object LineRepository {
                 .onFailure { Log.d(TAG, "could not resolve ${unknown.size} sender(s): $it") }
         }
 
+        // Read now, not on the way in.  The fan-out above is one request per
+        // chat and takes seconds, and the long-poll keeps delivering
+        // throughout — a snapshot taken before it would not know about a
+        // message that arrived, and was notified for, while it ran, so this
+        // sweep would announce it a second time.  That lands on the same
+        // notification id, which re-alerts rather than stacks: one notification
+        // that made the sound twice, a few seconds apart.
+        //
+        // The stored copy is the base, not merely a fallback for a restarted
+        // process.  The summaries below are rebuilt from groups and contacts
+        // alone, so a conversation with someone in neither — a stranger who has
+        // just messaged — drops straight back out of _chats, and reading only
+        // from there would forget a message we have already notified for and
+        // announce it again on the sweep after.  The live list overlays it,
+        // being the fresher of the two wherever both have an entry.
+        val previousLastIds = session.lastSeenIds + _chats.value
+            .mapNotNull { s -> s.lastMessage?.id?.let { s.chatMid to it } }
+            .toMap()
+
         // A chat whose last message id moved since the previous sweep has
-        // something we have not seen.  On the very first sweep everything looks
-        // new, so nothing is reported — otherwise signing in would fire a
-        // notification for every conversation at once.
+        // something we have not seen.  With nothing to compare against every
+        // chat looks new at once, which is a fresh sign-in rather than a
+        // backlog, so that one case still reports nothing.
         val changed = latest.entries.mapNotNull { (mid, msg) ->
             if (msg == null || previousLastIds.isEmpty()) return@mapNotNull null
-            val had = previousLastIds[mid]
-            if (had == null || had == msg.id) return@mapNotNull null
+            // An absent entry is a conversation that did not exist last time —
+            // a first message from someone new, or a group we have just been
+            // added to.  Skipping those was silently swallowing exactly the
+            // messages most worth hearing about.
+            if (previousLastIds[mid] == msg.id) return@mapNotNull null
             if (msg.sender == c.mid || mid == openChatMid) return@mapNotNull null
             mid to msg
         }
@@ -542,9 +633,27 @@ object LineRepository {
             }
             .sortedByDescending { it.timestamp }
         _chats.value = summaries
+        rememberLastSeen()
 
         val byMid = summaries.associateBy { it.chatMid }
         return@coroutineScopeIO changed.mapNotNull { (mid, msg) -> byMid[mid]?.let { it to msg } }
+    }
+
+    /**
+     * Snapshot what has been seen, so a restarted process resumes from here
+     * rather than from nothing.
+     *
+     * Worth doing on every batch and not just on a sweep: dying right after a
+     * long-poll notification would otherwise leave the stored ids behind the
+     * ones already notified, and the next sweep would report them a second time.
+     */
+    private fun rememberLastSeen() {
+        // Merged, for the same reason the read above is: a sweep drops chats it
+        // cannot attribute to a group or a contact, and replacing wholesale
+        // would throw away what was seen in them.
+        session.lastSeenIds = session.lastSeenIds + _chats.value
+            .mapNotNull { s -> s.lastMessage?.id?.let { s.chatMid to it } }
+            .toMap()
     }
 
     private fun senderLabel(mid: String, selfMid: String): String =
@@ -1200,6 +1309,15 @@ object LineRepository {
                         msg.to == c.mid -> msg.sender ?: continue
                         else -> msg.to ?: continue
                     }
+                    // A redelivered op is not a new message.  appendMessage
+                    // folds one away silently, but the notify below would still
+                    // fire — and a second notify for the same chat re-alerts
+                    // rather than stacking, so it lands as one notification that
+                    // made the sound twice.
+                    val known = msg.id != null &&
+                        _messages.value[chatMid].orEmpty().any { it.id == msg.id }
+                    if (known) continue
+
                     val incoming = msg.sender != c.mid
                     if (incoming && chatMid != openChatMid) {
                         unread[chatMid] = (unread[chatMid] ?: 0) + 1
@@ -1215,6 +1333,7 @@ object LineRepository {
                 else -> Log.d(TAG, "unhandled op ${op.opType}")
             }
         }
+        if (ops.isNotEmpty()) rememberLastSeen()
         return notify
     }
 

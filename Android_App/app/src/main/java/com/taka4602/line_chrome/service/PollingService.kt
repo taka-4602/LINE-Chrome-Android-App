@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.ServiceCompat
 import com.taka4602.line_chrome.data.LineRepository
 import com.taka4602.line_chrome.line.ChatSummary
@@ -94,7 +95,7 @@ class PollingService : Service() {
     private fun startInForeground(text: String) {
         val notification = Notifier.serviceNotification(this, text)
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         } else {
             0
         }
@@ -216,6 +217,24 @@ class PollingService : Service() {
         for ((chat, msg) in messages) {
             notifier.notifyMessage(chat, msg, LineRepository.nameOf(msg.sender))
         }
+    }
+
+    /**
+     * The platform has decided this service has run long enough.
+     *
+     * specialUse is not supposed to carry a runtime budget, so reaching here at
+     * all means the platform reads it differently than documented — but leaving
+     * without answering is not an option either way.  Miss the few seconds this
+     * allows and the process is killed outright with RemoteServiceException,
+     * which loses the connection just the same and takes the app down with it.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "foreground service timed out (type $fgsType); stopping before we are killed")
+        LineRepository.setConnection(
+            LineRepository.Connection.Degraded("Background time limit reached — reopen the app")
+        )
+        stopSelf(startId)
     }
 
     override fun onDestroy() {

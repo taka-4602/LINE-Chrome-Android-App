@@ -64,6 +64,7 @@ import com.taka4602.line_chrome.ui.screens.LoginScreen
 import com.taka4602.line_chrome.ui.screens.MediaViewerScreen
 import com.taka4602.line_chrome.ui.screens.ProfileScreen
 import com.taka4602.line_chrome.ui.screens.SettingsScreen
+import kotlinx.coroutines.awaitCancellation
 
 /**
  * Where the panes split.
@@ -165,19 +166,41 @@ private fun SignedIn(
         onPendingChatConsumed()
     }
 
-    LaunchedEffect(openChatMid) {
-        val mid = openChatMid
-        LineRepository.openChatMid = mid
-        if (mid != null) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+
+    // Claiming the open chat has to happen on every resume, not just when the
+    // selection changes.  Backgrounding gives the chat up so an incoming message
+    // notifies instead of being folded in silently, and coming back to the same
+    // mid is not a state change — so keyed on the selection alone this never ran
+    // again, and watchOpenChat's refresh loop stayed dead until the reload
+    // button was pressed.
+    LaunchedEffect(lifecycle, openChatMid, pendingChatMid) {
+        // A notification tap resumes us still pointing at the previously open
+        // chat and redirects a beat later.  Claiming during that beat fetches
+        // the wrong conversation and, worse, cancels its notification out of the
+        // tray — so sit the resume out until the pending target has landed.
+        if (pendingChatMid != null) return@LaunchedEffect
+        val mid = openChatMid ?: return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            LineRepository.openChatMid = mid
+            // The long-poll dies quietly while backgrounded, so nothing that
+            // arrived in the meantime can be trusted to have landed.
             LineRepository.loadMessages(mid)
             LineRepository.clearUnread(mid)
+            try {
+                awaitCancellation()
+            } finally {
+                // Guarded: switching straight from one chat to another cancels
+                // this after the incoming effect has already staked its claim,
+                // and an unconditional clear would wipe the new mid.
+                if (LineRepository.openChatMid == mid) LineRepository.openChatMid = null
+            }
         }
     }
 
     // Coming back to the chat list should show current state.  Without this the
     // list only ever moves when the refresh button is pressed, which makes a
     // stalled long-poll indistinguishable from a broken app.
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(lifecycle, tab, openChatMid) {
         if (tab != Tab.Chats || openChatMid != null) return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {

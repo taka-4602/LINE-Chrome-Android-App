@@ -6,7 +6,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:name=".LineApp"
@@ -33,12 +33,20 @@
             </intent-filter>
         </activity>
 
-        <!-- dataSync is the closest fit for a long-poll: there is no push
-             channel to fall back on, because LINE delivers through its own app. -->
+        <!-- dataSync would be the closer-sounding fit, but it is budgeted at six
+             hours per day on Android 14+ — after which the system stops the
+             service and messages simply stop arriving until the app is reopened.
+             A messaging connection cannot be part-time, and there is no push
+             channel to fall back on because LINE delivers through its own app,
+             so specialUse it is. -->
         <service
             android:name=".service.PollingService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Holds the long-poll connection that delivers incoming LINE messages. LINE provides no push channel to third-party clients, so the connection must stay open for notifications to arrive at all." />
+        </service>
 
         <!-- Hands a downloaded attachment to an external viewer or player
              without making it world-readable. -->

@@ -78,6 +78,7 @@ class MainActivity : ComponentActivity() {
         super.onPause()
         // While the app is backgrounded every chat counts as closed, so an
         // incoming message notifies instead of being silently folded in.
+        // AppRoot claims it back on RESUMED — this is only half the handshake.
         LineRepository.openChatMid = null
     }
 

@@ -31,11 +31,34 @@ class Notifier(private val context: Context) {
     private val history = mutableMapOf<String, MutableList<NotificationCompat.MessagingStyle.Message>>()
     private val ids = mutableMapOf<String, Int>()
 
+    /**
+     * Message ids already announced, per chat.
+     *
+     * There is more than one way for the same message to reach here — a
+     * redelivered op, or a safety-net sweep that was already in flight when the
+     * long-poll delivered it — and a second post under the same id re-alerts
+     * instead of stacking, so it lands as one notification that made the sound
+     * twice.  The senders upstream each dedupe their own path; this is the one
+     * place that sees all of them.
+     */
+    private val posted = mutableMapOf<String, LinkedHashSet<String>>()
+
     // Guarded by hasPermission() on the next line, which lint cannot follow
-    // across the call.
+    // across the call.  Synchronized because the poll loop and the safety-net
+    // sweep both deliver from their own coroutine, and the maps above are not
+    // concurrent.
     @SuppressLint("MissingPermission")
+    @Synchronized
     fun notifyMessage(chat: ChatSummary, msg: Message, senderName: String) {
         if (!hasPermission()) return
+
+        // An id-less message cannot be recognised on the way round again;
+        // announcing it is the lesser of the two failures.
+        if (msg.id != null) {
+            val seen = posted.getOrPut(chat.chatMid) { LinkedHashSet() }
+            if (!seen.add(msg.id)) return
+            while (seen.size > MAX_SEEN_IDS) seen.remove(seen.first())
+        }
 
         val person = Person.Builder().setName(senderName).setKey(msg.sender ?: senderName).build()
         val line = NotificationCompat.MessagingStyle.Message(
@@ -79,6 +102,12 @@ class Notifier(private val context: Context) {
         runCatching { manager.notify(id, notification) }
     }
 
+    /**
+     * `posted` deliberately survives this.  Opening a chat dismisses what is on
+     * screen, but a duplicate of a message from just before that is still a
+     * duplicate — and a genuinely new message carries a new id regardless.
+     */
+    @Synchronized
     fun clearChat(chatMid: String) {
         history.remove(chatMid)
         ids.remove(chatMid)?.let { manager.cancel(it) }
@@ -101,6 +130,9 @@ class Notifier(private val context: Context) {
         const val CHANNEL_SERVICE = "service"
         private const val GROUP_KEY = "com.taka4602.line_chrome.MESSAGES"
         private const val MAX_LINES = 6
+
+        /** Ids kept per chat for the duplicate check; a few minutes' worth. */
+        private const val MAX_SEEN_IDS = 64
 
         /** The ongoing-service notification; fixed id so the service can update it. */
         const val SERVICE_NOTIFICATION_ID = 1
