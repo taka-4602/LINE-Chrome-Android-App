@@ -29,6 +29,7 @@ Dark theme only. `minSdk` 24, `targetSdk` 36, Material 3.
 | E2EE group — decrypt | working |
 | E2EE group — encrypt | **not implemented**, see [Known limits](#known-limits) |
 | Background polling + notifications | working, see [Message delivery](#message-delivery) |
+| Messages that arrived while the app was dead | delivered on next start |
 | Foldable / tablet two-pane layout | working |
 | Light theme | deliberately absent |
 
@@ -105,6 +106,12 @@ are cached alongside successes**: several loops tend to notice the same dead
 session at once, and a wrong password that re-attempted `loginV2` on every call
 would be a login storm — precisely the request volume that gets an account
 flagged.
+
+Only a real rejection reaches the login screen. A wrong password or a demand for
+a PIN needs the user; a timeout does not, so a network failure leaves the UI
+alone and hands off to a watchdog that retries in the background, backing off
+from 15s to a 5-minute ceiling. Coming back from a tunnel therefore costs
+nothing, while a genuinely wrong password stops being retried almost at once.
 
 ## Layout
 
@@ -260,10 +267,13 @@ shows the route in use.
 
 `/P3 fetchOperations` is a **short-poll**: it answers immediately with an empty
 list when nothing has happened, rather than holding the request open. That is
-fine, just not a long-poll — the service notices and spaces the calls 5s apart
-instead of hammering, which is close enough to live and well clear of the request
-rate that
+fine, just not a long-poll — but it has to be detected rather than assumed, since
+a genuine long-poll also returns quickly when there is a backlog. Three
+consecutive empty answers inside a second is the signal; after that the calls are
+spaced 5s apart instead of hammering, which is close enough to live and well
+clear of the request rate that
 [gets accounts banned](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1).
+A 2s floor applies either way, so no endpoint can make the loop spin.
 
 ### The safety net
 
@@ -275,8 +285,8 @@ always:
 - every 25s it calls `getLastOpRevision`, a **single** request that says whether
   the account moved at all;
 - only when it has does it pay for the per-chat sweep;
-- and it stands down entirely while the poll is visibly delivering, so a healthy
-  connection costs almost nothing.
+- and it stands down entirely while the poll is visibly delivering — any op in
+  the last 60s — so a healthy connection costs almost nothing.
 
 That cheap revision check matters: LINE
 [bans accounts that poll hard](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1),
@@ -289,15 +299,50 @@ where they are being read without adding steady background load.
 **Settings → Connection** shows when the safety net last ran, which is the
 quickest way to tell whether background delivery is alive.
 
+### Across process death
+
+The last message id seen in each chat is written to disk, not just held in
+memory. Without that a restarted process cannot tell a backlog from a first
+sweep, and the only safe reading of "every chat looks new" is to stay quiet —
+so anything that arrived while the app was dead used to vanish silently. With
+the ids persisted the first sweep after a restart knows exactly which messages
+are genuinely new and notifies for those alone.
+
 ### When the poll is down
 
-The app shows a banner — tap it for the per-candidate probe results, long-press
-to copy them — and the service notification reads "Polling (long-poll
-unavailable)" rather than a bare "Reconnecting…". The same detail is in logcat:
+Delivery falls back rather than stopping. The service keeps messages moving over
+plain TalkService refreshes every 10s, stays there for 10 minutes, and only then
+re-probes the candidate list — deliberately *not* between every refresh, because
+a single hung candidate costs minutes and starves the fallback it was meant to
+be checking on.
+
+A failure that is really a **dead token** is caught before any of that: the
+session is rebuilt and the poll resumes, since dropping to the fallback would
+only fail the same way.
+
+While degraded, the app shows a banner reading "Live updates unavailable —
+checking periodically instead"; tapping expands the per-candidate probe results
+and long-pressing copies them. The service notification reads "Checking every
+10s", and **Settings → Connection** carries the same detail behind a Copy
+button. So does logcat:
 
 ```bash
 adb logcat -s PollingService:* LineClient:*
 ```
+
+### Notifications
+
+One notification per chat, `MessagingStyle`, so a busy conversation stacks its
+last few lines instead of replacing them. Tapping opens that chat; opening it in
+the app dismisses it. **Settings → Notify on new messages** turns them off
+without touching the connection.
+
+Announced message ids are remembered per chat — 64 of them, a few minutes' worth
+— and that check lives in the notifier rather than in each caller. There is more
+than one route to the same message: a redelivered op, or a safety-net sweep that
+was already in flight when the poll delivered it. Each sender dedupes its own
+path, but only the notifier sees all of them, and a second post under the same id
+re-alerts rather than stacking — one notification that made the sound twice.
 
 ### Stopping it
 
@@ -309,10 +354,25 @@ let you dismiss a foreground service notification.
 intent: that clears the started state at the framework, so `START_STICKY` does
 not resurrect the service the moment the process exits.
 
-**Caveat:** the service is declared `dataSync`, which on Android 14+ has a daily
-runtime budget. The system can stop it after several hours and the app has to be
-reopened to reconnect. There is no foreground service type that fits a
-third-party messaging client.
+### Foreground service type
+
+None of the documented types fits a third-party messaging client, so the choice
+is between bad options. `dataSync` sounds closest but is **budgeted at six hours
+a day** on Android 14+, after which the system stops the service and messages
+simply stop arriving until the app is reopened — and there is no push channel to
+cover the gap, because LINE delivers through its own app. A messaging connection
+cannot be part-time, so the service is declared **`specialUse`** with a
+`PROPERTY_SPECIAL_USE_FGS_SUBTYPE` explaining why.
+
+`specialUse` is not supposed to carry a runtime budget, but `onTimeout` is
+implemented anyway (Android 15+): if the platform ever does time the service out,
+it stops cleanly and the banner reads "Background time limit reached — reopen the
+app". Ignoring that callback does not buy more time — it gets the process killed
+outright with `RemoteServiceException`, which loses the connection and takes the
+app down with it.
+
+Note that `specialUse` is a declaration Google Play reviews for Play Store
+distribution.
 
 ## Tests
 
@@ -358,7 +418,23 @@ Found here, and worth fixing in the Python client too:
   halves until the server accepts.
 
 Inherited from the Python client, and documented at more length in
-[`LINE_Chrome_Python/README.md`](https://github.com/taka-4602/LINE-Chrome-Android-App/tree/main/LINE_Chrome_Python):
+[`LINE_Chrome_Python/README.md`](LINE_Chrome_Python/README.md):
+
+- **Sending to a letter-sealed group fails** with `[code=99] old group key`. The
+  plain send is refused outright rather than answered with `E2EE_RETRY_ENCRYPT`,
+  so there is no fallback to take. Group sealing needs `registerE2EEGroupKey`,
+  which neither client implements. Sealed groups can still be read.
+- Messages this client sends may show "can't be decrypted" on your other devices.
+  It signs with the key id lifted from the key chain rather than registering its
+  own via `registerE2EEPublicKey`. Not fully diagnosed.
+- Key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's current
+  key, so messages predating a rotation stay unreadable. Keys are cached to limit
+  future loss; they cannot be recovered retroactively.
+- The chat list costs one `getRecentMessagesV2` per chat, eight at a time, since
+  LINE has no call that returns it directly. Fine for tens of chats, slow for
+  hundreds.
+- TMoreCompact has no decoder here, which is why `/P5` is unusable even though it
+  is what CHRLINE polls.
 
 ## Disclaimer
 
