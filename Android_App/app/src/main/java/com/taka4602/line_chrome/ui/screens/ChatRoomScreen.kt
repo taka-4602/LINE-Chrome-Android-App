@@ -13,13 +13,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -56,9 +54,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -68,7 +64,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
@@ -129,44 +124,15 @@ fun ChatRoomScreen(
     // arrivals are worth animating to.
     var landed by remember(target.mid) { mutableStateOf(false) }
 
+    // The list is bottom-anchored, so the newest message is position 0.
     LaunchedEffect(target.mid, messages.size) {
         if (messages.isEmpty()) return@LaunchedEffect
         if (landed) {
-            listState.animateScrollToItem(messages.lastIndex)
+            listState.animateScrollToItem(0)
         } else {
-            listState.scrollToItem(messages.lastIndex)
+            listState.scrollToItem(0)
             landed = true
         }
-    }
-
-    // Anything that grows the composer — the keyboard pushing it up, the reply
-    // strip appearing above it — takes that height off the bottom of the list.
-    // Left alone the newest messages slide in behind it, so the list follows,
-    // and unwinds again when the keyboard or the reply goes away.  Only when it
-    // was already at the end, so replying to something from up in the history
-    // stays where it is rather than jumping.
-    val density = LocalDensity.current
-    val imeInsets = WindowInsets.ime
-    val latest by rememberUpdatedState(messages)
-    LaunchedEffect(listState, density, imeInsets) {
-        var followEnd = true
-        var wasOpen = false
-        var wasReplying = false
-        snapshotFlow { imeInsets.getBottom(density) to (replyingTo != null) }
-            .collect { (ime, replying) ->
-                // Sampled as each growth begins, before the list has been
-                // remeasured, so it still reflects the position it grew from.
-                if ((!wasOpen && ime > 0) || (!wasReplying && replying)) {
-                    followEnd = !listState.canScrollForward
-                }
-                wasOpen = ime > 0
-                wasReplying = replying
-                // Deferred to the next measure pass — scrolling now would clamp
-                // against the height the list is about to lose.
-                if (followEnd && latest.isNotEmpty()) {
-                    listState.requestScrollToItem(latest.lastIndex)
-                }
-            }
     }
 
     Scaffold(
@@ -250,6 +216,10 @@ fun ChatRoomScreen(
                 horizontal = 12.dp, vertical = 8.dp
             ),
             verticalArrangement = Arrangement.spacedBy(2.dp),
+            // Anchored at the bottom, which is what keeps the newest messages in
+            // view when the keyboard or the reply strip takes height off the
+            // list: the content it is pinned to is the edge that moves.
+            reverseLayout = true,
         ) {
             itemsIndexedStable(messages) { index, msg ->
                 val previous = messages.getOrNull(index - 1)
@@ -284,14 +254,27 @@ fun ChatRoomScreen(
     }
 }
 
-/** LazyListScope helper: itemsIndexed keyed on message id where one exists. */
+/**
+ * itemsIndexed keyed on message id where one exists, laid out newest first.
+ *
+ * The list is reversed so it stays anchored to the bottom, which puts the
+ * newest message at position 0.  That mapping is confined to here, so the
+ * content lambda still gets the index a message actually has in [messages] —
+ * oldest first — and can look back at the one before it.
+ */
 private inline fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedStable(
     messages: List<Message>,
     crossinline content: @Composable (Int, Message) -> Unit,
 ) = items(
     count = messages.size,
-    key = { index -> messages[index].id ?: "idx-$index" },
-) { index -> content(index, messages[index]) }
+    key = { position ->
+        val index = messages.lastIndex - position
+        messages[index].id ?: "idx-$index"
+    },
+) { position ->
+    val index = messages.lastIndex - position
+    content(index, messages[index])
+}
 
 @Composable
 private fun DaySeparator(label: String) {
