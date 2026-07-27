@@ -1,4 +1,4 @@
-# LINE-Chrome-Android-App
+# LINE-Chrome-Android-App <img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/icon.png" width="7%">
 Chrome Extension LINEのAndroidアプリケーション  
 Chrome ExtensionのLINEをダウンロードたり、[CHRLINE](https://github.com/DeachSword/CHRLINE) を見たり、Sonnet 4.6を使ったりして作った、LLMふつうにすごい  
 すでにビルド済みのアプリは [ここ](https://github.com/taka-4602/LINE-Chrome-Android-App/releases/tag/apk) からどうぞ
