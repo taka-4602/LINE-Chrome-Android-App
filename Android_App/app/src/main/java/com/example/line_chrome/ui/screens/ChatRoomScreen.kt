@@ -13,11 +13,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -54,7 +56,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -64,6 +68,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
@@ -131,6 +136,30 @@ fun ChatRoomScreen(
         } else {
             listState.scrollToItem(messages.lastIndex)
             landed = true
+        }
+    }
+
+    // The composer rides above the keyboard, so the list loses that much height
+    // from the bottom — left alone, the newest messages slide in behind the
+    // keyboard.  Following the inset keeps them in view, and reverses when the
+    // keyboard goes away.  Only when the list was already at the end, so a
+    // reply started from somewhere up in the history stays put.
+    val density = LocalDensity.current
+    val imeInsets = WindowInsets.ime
+    val latest by rememberUpdatedState(messages)
+    LaunchedEffect(listState, density, imeInsets) {
+        var followEnd = true
+        var wasOpen = false
+        snapshotFlow { imeInsets.getBottom(density) }.collect { ime ->
+            // Sampled as the keyboard starts to open: the list has not been
+            // remeasured yet, so this still reflects the pre-keyboard position.
+            if (!wasOpen) followEnd = !listState.canScrollForward
+            wasOpen = ime > 0
+            // Deferred to the next measure pass — scrolling now would clamp
+            // against the height the list is about to lose.
+            if (followEnd && latest.isNotEmpty()) {
+                listState.requestScrollToItem(latest.lastIndex)
+            }
         }
     }
 
