@@ -1,6 +1,7 @@
 # LINE-Chrome-Android-App
 Chrome Extension LINEのAndroidアプリケーション  
 Chrome ExtensionのLINEをダウンロードたり、[CHRLINE](https://github.com/DeachSword/CHRLINE) を見たり、Sonnet 4.6を使ったりして作った、LLMふつうにすごい  
+すでにビルド済みのアプリは [ここ](https://github.com/taka-4602/LINE-Chrome-Android-App/releases/tag/apk) からどうぞ
 
 ## アプリの説明とデモ
 LINE非公式クライアントのAndroidアプリ  
