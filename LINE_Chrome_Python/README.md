@@ -17,6 +17,9 @@ def on_msg(msg, op):
 line.listen()
 ```
 
+It is a library, not an application: the package is the whole project, and
+there is no CLI or entry-point script.
+
 ## Status
 
 | Area | State |
@@ -29,30 +32,43 @@ line.listen()
 | Send media (image / video / audio / file) — unsealed chats | working |
 | Send media — sealed chats | **not implemented** — needs the encrypted-media flow |
 | Download media, including from sealed chats | working |
-| Upload of large files | untested — likely needs chunked range upload |
+| Upload of large files | untested — a chunked/range upload is not implemented |
 
 ## Install
 
-```bash
-pip install -r requirements.txt
-```
-
-Needs `httpx[http2]`, `requests`, `rsa`, `pycryptodome`, `cryptography`, `xxhash`.
-
-## The CLI demo
+There is no `requirements.txt` and no packaging metadata — drop the
+`line_chrome/` directory next to your script, or put its parent on
+`PYTHONPATH`, and install the dependencies yourself:
 
 ```bash
-python example.py                     # "Chats" tab: name + last message
-python example.py all                 # every group, room and contact
-python example.py keys                # E2EE keys on this account vs ours
-python example.py profile <who>       # one user's profile
-python example.py send <who> <text>   # by display name or MID
-python example.py image <who> <path>  # send media; type inferred from extension
-python example.py download <who>      # save media from a chat's history
-python example.py listen              # stream incoming messages
+pip install "httpx[http2]" requests rsa pycryptodome cryptography xxhash
 ```
 
-Credentials come from `LINE_EMAIL` / `LINE_PASSWORD` if set.
+Python 3.9+. `cryptography` must be new enough to have
+`X25519PrivateKey.private_bytes_raw()` (42.0+); developed against 3.11 with
+`cryptography` 46.
+
+## Quick tour
+
+```python
+from line_chrome import LINE, LineServiceError
+
+line = LINE("you@example.com", "password")
+print(line.mid)                                  # own MID, set at login
+
+for s in line.get_chat_summaries():              # the "Chats" tab
+    print(f"{s.name:24} {s.sender_name or '':12} {s.preview}")
+
+line.send_message("c1234...", "hello")
+line.send_image("c1234...", "icon.png")
+
+for m in line.get_recent_messages("c1234...", count=20):
+    print(m.sender, m.text)                      # decrypted where possible
+```
+
+Every server-side failure raises `LineServiceError`, which carries `.code` and
+`.message`. Codes matter: `82` is `E2EE_RETRY_ENCRYPT` (handled internally by
+`send_message`), `89` is a rejected E2EE secret during login.
 
 ## Logging in
 
@@ -68,7 +84,7 @@ The first login prints a pincode (default `202202`) that you type into the LINE
 app on your phone. That device confirmation is what hands over the E2EE key
 chain, so it is not optional if you want sealed chats to work.
 
-Afterwards three things are cached beside the package, **not** in the current
+Afterwards several things are cached beside the package, **not** in the current
 directory — so the script works no matter where it is launched from:
 
 | Path | Contents |
@@ -88,19 +104,29 @@ LINE(email, password, save_path="/somewhere/else", pincode="123456")
 
 ## API
 
+Everything returns typed `NamedTuple`s from `line_chrome.types` — `Profile`,
+`Contact`, `Chat`, `ChatSummary`, `Message`, `Location`, `Operation`,
+`SendMessageResult` — alongside the int-constant enums `OpType`, `MIDType`,
+`ContentType`, `ChatType` and `MessageRelationType`. All of them are re-exported
+from the package root.
+
 ### Chats and contacts
 
 ```python
-line.get_profile()                     # -> Profile
-line.get_chats()                       # -> [Chat]   groups and rooms
-line.get_chats(include_peers=True)     # ...plus one per contact
+line.get_profile()                      # -> Profile
+line.get_chats()                        # -> [Chat]   groups and rooms
+line.get_chats(include_peers=True)      # ...plus one per contact
 line.get_chat_mids(include_peers=True)  # -> [mid], no Chat lookup
-line.get_all_contact_ids()             # -> [mid]
-line.get_contacts(mids)                # -> [Contact]
-line.get_contact(mid)                  # -> Contact, works for non-friends too
-line.find_contact_by_userid("handle")  # -> Contact, by @LINE ID (unverified)
-line.get_chat_summaries()              # -> [ChatSummary]  the "Chats" tab
+line.get_all_contact_ids()              # -> [mid]
+line.get_contacts(mids)                 # -> [Contact]
+line.get_contact(mid)                   # -> Contact, works for non-friends too
+line.find_contact_by_userid("handle")   # -> Contact, by @LINE ID (unverified)
+line.get_chat_summaries()               # -> [ChatSummary]  the "Chats" tab
 ```
+
+`get_chats()` and `get_contacts()` chunk their MID lists (`chunk_size=200`),
+because the request carries the whole list in one struct and a large friend
+list would otherwise overflow it.
 
 `getAllChatMids` only returns groups and rooms. A 1:1 chat has no room object
 server-side — it is addressed by the peer's own MID — so direct chats come from
@@ -108,12 +134,20 @@ the contact list instead. `get_chat_summaries()` merges both and attaches each
 chat's last message, newest first:
 
 ```python
-for s in line.get_chat_summaries():
-    print(s.name, s.preview, s.timestamp)
+for s in line.get_chat_summaries(include_peers=True, include_empty=False,
+                                 max_workers=8):
+    print(s.name, s.sender_name, s.preview, s.timestamp)
 ```
 
-There is no LINE call that returns this directly; the official client keeps a
-local message box synced from `fetchOps`. This issues one
+`ChatSummary` flattens the two places a name can live (a group's `chat_name`
+versus a peer's contact name) into `.name`, and `.preview` renders the one-line
+body the official client shows — `[Sticker]` for non-text, `[Encrypted]` when
+the ciphertext could not be opened. `.sender_name` is `"You"` for your own
+messages, and group senders who are not in your contact list are resolved in one
+extra batch so previews show a name rather than a raw MID.
+
+There is no LINE call that returns this list directly; the official client keeps
+a local message box synced from `fetchOps`. This issues one
 `getRecentMessagesV2(count=1)` per chat, concurrently — fine for tens of chats,
 noticeable for hundreds.
 
@@ -123,12 +157,23 @@ noticeable for hundreds.
 line.send_message(to, "hello")                     # seals if the chat requires it
 line.send_message(to, "hi", reply_to=message_id)
 line.send_message(to, "hi", e2ee=True)             # force sealing
+line.send_message(to, text, content_type=7)        # 7=STICKER, 9=GIFT, 13=CONTACT…
 line.get_recent_messages(chat_mid, count=20)       # -> [Message], decrypted
 line.unsend_message(message_id)
 line.send_read_receipt(chat_mid, message_id)
 ```
 
 MID prefixes: `u` user, `c` group, `r` room.
+
+`send_message` returns a `SendMessageResult`; the created message — and so its
+id, for a later `unsend_message` or `reply_to` — is at `.message`.
+
+A `Message` carries `id`, `sender`, `to`, `to_type`, `created_time` (ms epoch),
+`text`, `content_type`, `content_metadata`, `has_content`, `location`,
+`related_message_id`, `relation_type` and `chunks` (the raw E2EE ciphertext when
+the message is sealed). Note that LINE sends plain text as `ContentType.NONE`
+(0), so `ContentType.TEXT` is 0 as well; `ContentType.name(v)` gives a human
+label.
 
 `Contact` and `Profile` expose `.picture_url()` / `.picture_url(preview=True)`,
 since `picture_path` comes back CDN-relative and the API never sends the host.
@@ -137,25 +182,31 @@ since `picture_path` comes back CDN-relative and the API never sends the host.
 ### Media
 
 ```python
-line.send_image(to, "icon.png")            # path, URL or bytes
+line.send_image(to, "icon.png")                   # path, URL or bytes
 line.send_video(to, "clip.mp4", duration=15000)   # duration in ms
 line.send_file(to, "doc.pdf")
-line.send_media(to, data, "audio")         # image/video/audio/file/gif
+line.send_media(to, data, "audio")                # image/video/audio/file/gif
 
-line.download_image(msg)                   # -> bytes, decrypted if sealed
+line.download_image(msg)                          # -> bytes, decrypted if sealed
 line.download_image(msg, path="out.jpg")
-line.download_image(msg, size="preview")   # or "m800x1200", "w800"
+line.download_image(msg, preview=True)            # thumbnail
+line.download_image(msg, size="m800x1200")        # or "w800"; plain media only
 ```
+
+`preview=True` is a flag rather than a `size` value because plain and sealed
+media address the thumbnail completely differently — a `/preview` path segment
+versus a separate `<OID>__ud-preview` object. `size` is ignored (with a warning)
+for sealed media, which is not resizable server-side.
 
 There is no "attach a file to a message" call. The recipient travels in the
 upload params as `tomid`, so **the upload itself creates the message** — the
-send functions return an object id and hash rather than a `Message`.
+send functions return `{"objectId": ..., "hash": ...}` rather than a `Message`.
 
 Uploads go to the **gateway** (`gwz.line.naver.jp/oa/r/talk/m/reqseq`), not to
 `obs.line-apps.com` as the config domain suggests. Any device type other than
 `CHROMEOS` must trade its auth token via `acquireEncryptedAccessToken` and use
 the part after the `\x1e` separator as `X-Line-Access`; the plain token is
-rejected.
+rejected. This client identifies as `DESKTOPWIN`, so it always takes that path.
 
 Downloads are keyed differently depending on sealing, which is easy to get
 wrong:
@@ -195,10 +246,13 @@ def any_event(op): ...       # every operation
 line.listen()                # blocks; Ctrl-C to stop
 ```
 
-`listen()` seeds from `line.get_last_op_revision()` so it starts at the present rather
-than replaying the account's history, then long-polls `fetchOps` on `/P4`.
+`listen()` seeds from `line.get_last_op_revision()` so it starts at the present
+rather than replaying the account's history, then long-polls `fetchOps` on `/P4`.
 Handlers run on daemon threads by default; pass `threaded=False` for
 sequential dispatch. A handler that raises is logged, not fatal.
+
+`Operation` exposes `revision`, `created_time`, `op_type` (an `OpType`
+constant), `req_seq`, `param1`–`param3` and `message`.
 
 ### E2EE internals
 
@@ -236,6 +290,9 @@ aad     = to ‖ from ‖ senderKeyId ‖ recvKeyId ‖ specVersion ‖ contentT
 chunks  = [salt, AES-256-GCM(gcmKey, nonce, json, aad), nonce, sKid, rKid]
 ```
 
+specVersion 2 is AES-GCM as above; version 1 is the older AES-CBC form, which
+this client can still decrypt.
+
 Groups do not do this pairwise. The creator generates one key pair for the
 group and gives each member a copy of the private half, wrapped with
 `ECDH(creator, member)` — note **no salt** in that wrapping, unlike message
@@ -244,11 +301,10 @@ same derivation with *your own* public key: `senderKeyId` is yours,
 `receiverKeyId` is the group's, and `specVersion` is fixed at 2 rather than
 negotiated (there is no single peer to negotiate with).
 
-`registerE2EEGroupKey` is **not** part of sending. It only creates a group key
-where none has ever existed; any group that is already sealed has one, and
-`getLastE2EEGroupSharedKey` returns it. Server error code 5 on that call is the
-signal that registration is needed — this client does not implement it, so a
-never-sealed group cannot be sealed *by* this client.
+`registerE2EEGroupKey` is **not** part of sending, and this client does not
+implement it. It only creates a group key where none has ever existed; any group
+that is already sealed has one, and `getLastE2EEGroupSharedKey` returns it. A
+group that has never been sealed therefore cannot be sealed *by* this client.
 
 Which key id is *yours* depends on direction: for an incoming message you are
 the receiver, but for one you sent, your key is the **sender** key id. Getting
@@ -259,11 +315,14 @@ this wrong makes your own messages undecryptable while everyone else's work.
 - **Messages sent by this client may show "This message can't be decrypted" on
   your other devices.** We sign with the key id lifted from the key chain
   rather than registering our own via `registerE2EEPublicKey`, so a device that
-  never received that private half cannot read them. Run
-  `python example.py keys` to see the account's keys. Not fully diagnosed.
+  never received that private half cannot read them. Call
+  `line.get_e2ee_public_keys()` to see the account's keys. Not fully diagnosed.
 - **Key rotation is one-way.** `negotiateE2EEPublicKey` returns only a peer's
   *current* key, so messages predating a rotation stay unreadable. Keys are
-  cached to limit future loss; they cannot be recovered retroactively.
+  cached under `.e2eePublicKeys/` to limit future loss; they cannot be recovered
+  retroactively. A message whose key has since rotated fails loudly instead of
+  decrypting to garbage — `get_recent_messages` and `listen` log it and hand
+  back the message with its ciphertext intact.
 - **`getMessageBoxCompactWrapUpListV2`** would build the chat list in one call
   instead of N, but it is deprecated and neither reference implementation ships
   its response struct.
@@ -274,9 +333,12 @@ this wrong makes your own messages undecryptable while everyone else's work.
   `determineMediaMessageFlow`, a dual upload (object plus `__ud-preview`
   subresource), and the key material sent as an E2EE dict payload. Receiving
   sealed media does work.
-- **Large uploads are untested.** `genOBSParams` has handling for a `range` key
-  (`bytes 0-N/N`), implying a chunked protocol this client does not implement.
-  Small files upload fine; a large video may not.
+- **Large uploads are untested.** The whole file is POSTed in one request;
+  OBS also supports a chunked `range` upload (`bytes 0-N/N`) that this client
+  does not implement. Small files upload fine; a large video may not.
+- **Login is chatty.** The login path prints `[DBG]` diagnostics — including
+  token and key prefixes — straight to stdout. There is no logging switch;
+  redirect stdout if that matters to you.
 
 ## Gotchas worth knowing
 
@@ -299,10 +361,10 @@ Things that cost real debugging time here, in case you extend this:
 
 ```
 line_chrome/
-  client.py   LINE class: auth, talk, E2EE, polling
-  thrift.py   TBinary / TCompact encode + decode
-  types.py    Chat, Contact, Message, Operation, enums
-example.py    CLI demo
+  __init__.py   public exports
+  client.py     LINE class: auth, talk, E2EE, media, polling
+  thrift.py     TBinary / TCompact encode + decode, LineServiceError
+  types.py      Chat, ChatSummary, Contact, Message, Operation, Profile, enums
 ```
 
 ## Credit
