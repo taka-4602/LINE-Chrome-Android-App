@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
@@ -22,12 +24,14 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -36,9 +40,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.taka4602.line_chrome.data.LineRepository
 import com.taka4602.line_chrome.data.LineRepository.Connection
+import com.taka4602.line_chrome.data.PollingInterval
 import com.taka4602.line_chrome.line.Profile
 import com.taka4602.line_chrome.service.PollingService
 import com.taka4602.line_chrome.ui.components.Avatar
@@ -143,6 +149,10 @@ fun SettingsScreen(
             modifier = Modifier.padding(bottom = 8.dp),
         )
         ConnectionDetail(connection)
+
+        HorizontalDivider(Modifier.padding(vertical = 16.dp))
+
+        PollingSection()
 
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
 
@@ -275,6 +285,207 @@ fun SettingsScreen(
             },
         )
     }
+}
+
+/**
+ * Every cadence the poller runs on, editable, defaulting to the shipped values.
+ *
+ * There is no "apply" and no restart: the loops read each value once per tick,
+ * so a change lands on the next one.  The bounds live on [PollingInterval]
+ * rather than here — this only has to refuse to save what they reject.
+ */
+@Composable
+private fun PollingSection() {
+    val polling = LineRepository.sessionStore.polling
+    val context = LocalContext.current
+    // The store is not observable, so every row would keep showing the value it
+    // was composed with.  Bumping this after a write is what re-reads them.
+    var revision by remember { mutableIntStateOf(0) }
+    var editing by remember { mutableStateOf<PollingInterval?>(null) }
+
+    val seconds = remember(revision) { PollingInterval.entries.map { polling.seconds(it) } }
+    val overridden = remember(revision) { polling.anyOverridden }
+    val delivering = remember(revision) { polling.deliveryEnabled }
+
+    // The service is what runs these loops, so it has to be told.  Turning the
+    // last delivery path off leaves it nothing to do, and it should not sit in
+    // the notification shade claiming otherwise.
+    val applied: () -> Unit = {
+        revision++
+        if (LineRepository.auth.value is LineRepository.AuthState.LoggedIn) {
+            if (polling.deliveryEnabled) {
+                PollingService.start(context)
+            } else {
+                PollingService.stop(context)
+                // stop() alone would leave the Connection section showing
+                // whatever was true before this edit.
+                LineRepository.setConnection(
+                    LineRepository.Connection.Degraded(PollingService.OFF_REASON)
+                )
+            }
+        }
+    }
+
+    Text(
+        "Polling",
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(bottom = 4.dp),
+    )
+    Text(
+        "How often the app asks LINE for anything new. Shorter waits mean " +
+            "messages land sooner and more requests go out — LINE restricts " +
+            "accounts that poll hard, so the defaults stay well clear of it. " +
+            "Set one to 0 to turn it off.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(bottom = 8.dp),
+    )
+
+    if (!delivering) {
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer
+            ),
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+        ) {
+            Text(
+                "Every way of receiving messages is off, so nothing arrives at " +
+                    "all and the connection is stopped. Set the long-poll floor, " +
+                    "the fallback check or the safety-net check back above 0.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(12.dp),
+            )
+        }
+    }
+
+    PollingInterval.entries.forEachIndexed { index, interval ->
+        PollingIntervalRow(interval, seconds[index]) { editing = interval }
+    }
+
+    if (overridden) {
+        TextButton(onClick = { polling.resetAll(); applied() }) {
+            Text("Restore all defaults")
+        }
+    }
+
+    editing?.let { interval ->
+        PollingIntervalDialog(
+            interval = interval,
+            current = seconds[interval.ordinal],
+            onDismiss = { editing = null },
+            onSave = { polling.set(interval, it); applied(); editing = null },
+            onReset = { polling.reset(interval); applied(); editing = null },
+        )
+    }
+}
+
+@Composable
+private fun PollingIntervalRow(
+    interval: PollingInterval,
+    seconds: Int,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(interval.label, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                // At 0 the normal description describes something that is not
+                // happening, so say what 0 does instead.
+                if (seconds == 0) interval.zeroDescription else interval.description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                if (seconds == 0) interval.zeroLabel else formatInterval(seconds),
+                style = MaterialTheme.typography.titleMedium,
+                color = if (seconds == 0) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.primary,
+            )
+            if (seconds != interval.defaultSeconds) {
+                Text(
+                    "default ${formatInterval(interval.defaultSeconds)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PollingIntervalDialog(
+    interval: PollingInterval,
+    current: Int,
+    onDismiss: () -> Unit,
+    onSave: (Int) -> Unit,
+    onReset: () -> Unit,
+) {
+    var text by remember { mutableStateOf(current.toString()) }
+    val parsed = text.toIntOrNull()
+    // 0 is always legal and sits below minSeconds on purpose — it is the off
+    // switch, not a cadence.
+    val valid = parsed != null &&
+        (parsed == 0 || (parsed >= interval.minSeconds && parsed <= interval.maxSeconds))
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(interval.label) },
+        text = {
+            Column {
+                Text(
+                    interval.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.padding(top = 8.dp))
+                Text(
+                    "0 — ${interval.zeroLabel.lowercase()}: ${interval.zeroDescription}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.padding(top = 12.dp))
+                OutlinedTextField(
+                    // Digits only, so the value can never be out of range for a
+                    // reason the supporting text does not explain.
+                    value = text,
+                    onValueChange = { text = it.filter(Char::isDigit).take(5) },
+                    singleLine = true,
+                    isError = text.isNotEmpty() && !valid,
+                    label = { Text("Seconds") },
+                    supportingText = {
+                        Text(
+                            "0, or ${interval.minSeconds}–${interval.maxSeconds}s · " +
+                                "default ${interval.defaultSeconds}s"
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                TextButton(onClick = onReset) { Text("Restore default") }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = valid, onClick = { parsed?.let(onSave) }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+/** Minutes once seconds stop reading as a duration anyone can picture. */
+private fun formatInterval(seconds: Int): String = when {
+    seconds < 60 -> "${seconds}s"
+    seconds % 60 == 0 -> "${seconds / 60} min"
+    else -> "${seconds / 60} min ${seconds % 60}s"
 }
 
 /**

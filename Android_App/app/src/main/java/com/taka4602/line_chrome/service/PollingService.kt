@@ -10,6 +10,7 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.ServiceCompat
 import com.taka4602.line_chrome.data.LineRepository
+import com.taka4602.line_chrome.data.PollingInterval
 import com.taka4602.line_chrome.line.ChatSummary
 import com.taka4602.line_chrome.line.LineClient
 import com.taka4602.line_chrome.line.LineServiceError
@@ -52,7 +53,18 @@ class PollingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // startForeground must happen either way: a service started with
+        // startForegroundService and then stopped without it is killed with
+        // ForegroundServiceDidNotStartInTimeException.
         startInForeground("Connecting…")
+        if (!LineRepository.sessionStore.polling.deliveryEnabled) {
+            Log.i(TAG, "every delivery path is off; nothing to run")
+            LineRepository.setConnection(
+                LineRepository.Connection.Degraded(OFF_REASON)
+            )
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (pollJob == null) {
             pollJob = scope.launch { pollLoop() }
             scope.launch { syncLoop() }
@@ -78,9 +90,19 @@ class PollingService : Service() {
      */
     private suspend fun syncLoop() {
         while (scope.isActive) {
-            delay(SYNC_INTERVAL_MS)
+            val pace = interval(PollingInterval.SafetyNetCheck)
+            if (pace == 0L) {
+                // Switched off.  Idle rather than return, so turning it back on
+                // does not need the service restarting.
+                delay(IDLE_TICK_MS)
+                continue
+            }
+            delay(pace)
             if (LineRepository.client == null) continue
-            if (System.currentTimeMillis() - LineRepository.lastOpAt < SYNC_QUIET_MS) continue
+            // A zero quiet period means never skip, which this gets for free:
+            // no elapsed time is ever below it.
+            val quiet = interval(PollingInterval.SafetyNetQuiet)
+            if (System.currentTimeMillis() - LineRepository.lastOpAt < quiet) continue
 
             try {
                 notify(LineRepository.refreshViaTalkService())
@@ -111,6 +133,20 @@ class PollingService : Service() {
                 continue
             }
 
+            // Turned off, so there is nothing to probe and nothing to fail.
+            // Hand to the fallback, which is the only other thing this loop
+            // drives; with that off too the safety net is carrying delivery on
+            // its own and this loop has no work at all.
+            val polling = LineRepository.sessionStore.polling
+            if (!polling.isOn(PollingInterval.LongPollFloor)) {
+                if (polling.isOn(PollingInterval.FallbackCheck)) {
+                    fallbackSession("Long-poll turned off in Settings")
+                } else {
+                    idle("Long-poll and fallback turned off in Settings")
+                }
+                continue
+            }
+
             val failure = try {
                 liveSession(client)
                 null
@@ -132,9 +168,14 @@ class PollingService : Service() {
             }
 
             // The per-candidate probe results say far more than the last
-            // exception does.
-            val detail = client.pollDiagnostics.ifEmpty {
-                failure.message?.take(160) ?: failure::class.java.simpleName
+            // exception does — except when the route was fine and we walked away
+            // from it on purpose, where they would be misleading noise.
+            val detail = if (failure is ShortPollDisabled) {
+                failure.message.orEmpty()
+            } else {
+                client.pollDiagnostics.ifEmpty {
+                    failure.message?.take(160) ?: failure::class.java.simpleName
+                }
             }
             Log.w(TAG, "long-poll unavailable: $detail", failure)
             fallbackSession(detail)
@@ -169,6 +210,11 @@ class PollingService : Service() {
                 // Space the calls out rather than treating it as broken; LINE
                 // bans accounts that poll hard.
                 if (++instantEmpties >= SHORT_POLL_AFTER && !shortPolling) {
+                    // Short-polling turned off means the user would rather have
+                    // the fallback than a route that has to be asked repeatedly.
+                    if (!LineRepository.sessionStore.polling.isOn(PollingInterval.ShortPoll)) {
+                        throw ShortPollDisabled(client.activePollRoute?.toString())
+                    }
                     shortPolling = true
                     Log.i(TAG, "${client.activePollRoute} answers immediately; short-polling")
                     publishLive(client, shortPolling = true)
@@ -177,8 +223,10 @@ class PollingService : Service() {
                 instantEmpties = 0
             }
 
-            val interval = if (shortPolling) SHORT_POLL_INTERVAL_MS else MIN_POLL_INTERVAL_MS
-            val remaining = interval - elapsed
+            val pace = interval(
+                if (shortPolling) PollingInterval.ShortPoll else PollingInterval.LongPollFloor
+            )
+            val remaining = pace - elapsed
             if (remaining > 0) delay(remaining)
         }
     }
@@ -197,10 +245,23 @@ class PollingService : Service() {
      */
     private suspend fun fallbackSession(detail: String) {
         LineRepository.setConnection(LineRepository.Connection.Degraded(detail))
-        startInForeground("Checking every ${FALLBACK_INTERVAL_MS / 1000}s")
+        val session = interval(PollingInterval.FallbackSession)
 
-        val until = System.currentTimeMillis() + FALLBACK_SESSION_MS
-        while (scope.isActive && System.currentTimeMillis() < until) {
+        if (interval(PollingInterval.FallbackCheck) == 0L) {
+            // Nothing to run here, but returning would put the caller straight
+            // back into probing the long-poll — which is expensive and, if it
+            // fails fast, a hot loop.  Sit the session out instead.
+            startInForeground("Fallback is off")
+            delay(maxOf(session, PROBE_BACKOFF_MS))
+            return
+        }
+
+        startInForeground("Checking every ${interval(PollingInterval.FallbackCheck) / 1000}s")
+
+        // At least one check before handing back, so a zero-length session means
+        // "check once, then re-probe" rather than "do nothing, then re-probe".
+        val until = System.currentTimeMillis() + session
+        do {
             try {
                 notify(LineRepository.refreshViaTalkService())
             } catch (e: CancellationException) {
@@ -208,9 +269,30 @@ class PollingService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "fallback refresh failed: ${e.message}")
             }
-            delay(FALLBACK_INTERVAL_MS)
-        }
+            val pace = interval(PollingInterval.FallbackCheck)
+            if (pace == 0L) return // switched off mid-session
+            delay(pace)
+        } while (scope.isActive && System.currentTimeMillis() < until)
     }
+
+    /**
+     * Nothing for this loop to do.  Ticks rather than returns, so switching a
+     * path back on in Settings is picked up without restarting the service.
+     */
+    private suspend fun idle(reason: String) {
+        val state = LineRepository.Connection.Degraded(reason)
+        // Compared by value, so this only redraws when the reason actually
+        // changes rather than on every tick.
+        if (LineRepository.connection.value != state) {
+            LineRepository.setConnection(state)
+            startInForeground(reason)
+        }
+        delay(IDLE_TICK_MS)
+    }
+
+    /** [PollingInterval.ShortPoll] is off and the route needs short-polling. */
+    private class ShortPollDisabled(route: String?) :
+        Exception("$route answers immediately and short-polling is off")
 
     private fun notify(messages: List<Pair<ChatSummary, Message>>) {
         if (messages.isEmpty() || !LineRepository.sessionStore.notificationsEnabled) return
@@ -245,8 +327,9 @@ class PollingService : Service() {
 
     companion object {
         private const val TAG = "PollingService"
-        /** Floor between polls, so a long-poll that returns instantly cannot spin. */
-        private const val MIN_POLL_INTERVAL_MS = 2_000L
+
+        /** Shown wherever the service is not running because the user said so. */
+        const val OFF_REASON = "Polling turned off in Settings"
 
         /** Under this, a poll cannot be said to have blocked on anything. */
         private const val INSTANT_MS = 1_000L
@@ -254,29 +337,35 @@ class PollingService : Service() {
         /** Consecutive instant empty answers before treating this as a short-poll. */
         private const val SHORT_POLL_AFTER = 3
 
-        /**
-         * Pacing for an endpoint that answers immediately.  Still prompt enough
-         * to feel live, slow enough not to look like a hammering client.
-         */
-        private const val SHORT_POLL_INTERVAL_MS = 5_000L
-
-        /** How often the fallback asks TalkService for anything new. */
-        private const val FALLBACK_INTERVAL_MS = 10_000L
-
-        /** How long to stay on the fallback before re-probing the long-poll. */
-        private const val FALLBACK_SESSION_MS = 10 * 60_000L
+        /** How often a switched-off loop looks to see whether it is back on. */
+        private const val IDLE_TICK_MS = 2_000L
 
         /**
-         * Safety-net cadence.  One request per tick when the account is idle,
-         * so this is cheap enough to leave running permanently — LINE bans
-         * accounts that poll hard, which rules out anything more eager.
+         * Floor on re-probing the long-poll when the fallback is off and there
+         * is therefore nothing to pace the outer loop.  Probing runs the whole
+         * candidate list, so this must never be zero.
          */
-        private const val SYNC_INTERVAL_MS = 25_000L
+        private const val PROBE_BACKOFF_MS = 30_000L
 
-        /** Skip the safety net while the long-poll is visibly delivering. */
-        private const val SYNC_QUIET_MS = 60_000L
+        /**
+         * The cadences below are user-settable — see [PollingInterval] for what
+         * each one paces and what it defaults to.  They are read per tick rather
+         * than once, so an edit in Settings applies without restarting this
+         * service.
+         */
+        private fun interval(which: PollingInterval): Long =
+            LineRepository.sessionStore.polling.millis(which)
 
         fun start(context: Context) {
+            if (!LineRepository.sessionStore.polling.deliveryEnabled) {
+                // Starting only to stop again would flash a notification for no
+                // reason.  onStartCommand still checks, for the paths that do
+                // not come through here.
+                LineRepository.setConnection(
+                    LineRepository.Connection.Degraded(OFF_REASON)
+                )
+                return
+            }
             val intent = Intent(context, PollingService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)

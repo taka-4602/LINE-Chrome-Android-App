@@ -1,7 +1,10 @@
 package com.taka4602.line_chrome.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.SeekableTransitionState
+import androidx.compose.animation.core.rememberTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -64,6 +67,7 @@ import com.taka4602.line_chrome.ui.screens.LoginScreen
 import com.taka4602.line_chrome.ui.screens.MediaViewerScreen
 import com.taka4602.line_chrome.ui.screens.ProfileScreen
 import com.taka4602.line_chrome.ui.screens.SettingsScreen
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.awaitCancellation
 
 /**
@@ -82,6 +86,34 @@ private val LIST_PANE_MIN = 280.dp
 private val LIST_PANE_MAX = 400.dp
 
 private enum class Tab(val label: String) { Chats("Chats"), Friends("Friends"), Settings("Settings") }
+
+/**
+ * What the detail pane is showing, as identity rather than content.
+ *
+ * The pane rebuilds everything it draws from the mid, so this deliberately
+ * carries nothing else.  A [ChatTarget] would have been the obvious state to
+ * animate between, but it is a data class over a name and a picture that both
+ * arrive a moment after the conversation opens — each arrival would be a new,
+ * unequal value, and a seeking transition would restart mid-swipe every time.
+ */
+private sealed interface Pane {
+    val mid: String
+
+    data class Profile(override val mid: String) : Pane
+    data class Chat(override val mid: String) : Pane
+}
+
+/**
+ * How deep a pane sits, so a transition can tell going in from coming out.
+ *
+ * A profile is reachable both from the list and from a conversation; either way
+ * it is the deepest thing on screen, which is all this has to get right.
+ */
+private fun Pane?.depth() = when (this) {
+    null -> 0
+    is Pane.Chat -> 1
+    is Pane.Profile -> 2
+}
 
 @Composable
 fun AppRoot(pendingChatMid: String?, onPendingChatConsumed: () -> Unit) {
@@ -141,7 +173,10 @@ private fun SignedIn(
     var openProfile by rememberSaveable { mutableStateOf<String?>(null) }
     var openMedia by remember { mutableStateOf<Message?>(null) }
 
-    val openChat: ChatTarget? = openChatMid?.let { mid ->
+    // Built from the mid on demand rather than held in state, so the pane that
+    // is sliding out can still be described after the selection has been
+    // cleared — which is exactly the window a back gesture spends animating.
+    val chatTargetOf: (String) -> ChatTarget = { mid ->
         val info = profiles[mid]
         val summary = chats.find { it.chatMid == mid }
         ChatTarget(
@@ -153,13 +188,17 @@ private fun SignedIn(
                 ?: LineRepository.pictureOf(mid),
         )
     }
+
+    // Profile over conversation: opening someone's profile from a chat leaves
+    // the chat underneath it, and closing it comes back to the chat.
+    val pane: Pane? = openProfile?.let(Pane::Profile) ?: openChatMid?.let(Pane::Chat)
     var notificationsEnabled by remember {
         mutableStateOf(LineRepository.sessionStore.notificationsEnabled)
     }
     val snackbar = remember { SnackbarHostState() }
 
     // A notification tap arrives as an Intent extra.  Naming is no longer this
-    // effect's problem — openChat derives that from the mid.
+    // effect's problem — chatTargetOf derives that from the mid.
     LaunchedEffect(pendingChatMid) {
         val mid = pendingChatMid ?: return@LaunchedEffect
         openChatMid = mid
@@ -215,15 +254,10 @@ private fun SignedIn(
         }
     }
 
-    // Viewer over profile over conversation over tabs, so back unwinds one
-    // layer at a time.
-    BackHandler(enabled = openMedia != null || openProfile != null || openChat != null) {
-        when {
-            openMedia != null -> openMedia = null
-            openProfile != null -> openProfile = null
-            else -> openChatMid = null
-        }
-    }
+    // The viewer is the top layer and the only one that early-returns, so it
+    // takes back on its own.  Nothing is composed behind it to preview, so this
+    // stays an ordinary handler; the panes below get the predictive treatment.
+    BackHandler(enabled = openMedia != null) { openMedia = null }
 
     // The viewer is an overlay rather than another AnimatedContent branch, so
     // the conversation stays composed and keeps its scroll position underneath.
@@ -240,15 +274,16 @@ private fun SignedIn(
     // Both layouts render the same two panes; only their arrangement differs,
     // so the panes are defined once here and placed twice below.
     //
-    // `screen` is passed in rather than read from state because the stacked
+    // `shown` is passed in rather than read from state because the stacked
     // layout animates between panes — the outgoing one has to keep drawing what
     // it had, not what has just been selected.
-    val detailPane: @Composable (screen: Any?, sideBySide: Boolean) -> Unit = { screen, sideBySide ->
-        if (screen is String) {
+    val detailPane: @Composable (shown: Pane?, sideBySide: Boolean) -> Unit = { shown, sideBySide ->
+        if (shown is Pane.Profile) {
+            val mid = shown.mid
             ProfileScreen(
-                mid = screen,
-                profile = profiles[screen],
-                participants = LineRepository.participantsOf(screen),
+                mid = mid,
+                profile = profiles[mid],
+                participants = LineRepository.participantsOf(mid),
                 nameOf = LineRepository::nameOf,
                 pictureOf = LineRepository::pictureOf,
                 onLoad = LineRepository::loadProfile,
@@ -259,24 +294,25 @@ private fun SignedIn(
                 },
                 onOpenProfile = { openProfile = it },
             )
-        } else if (screen is ChatTarget) {
+        } else if (shown is Pane.Chat) {
+            val mid = shown.mid
             ChatRoomScreen(
-                target = screen,
-                messages = messages[screen.mid].orEmpty(),
+                target = chatTargetOf(mid),
+                messages = messages[mid].orEmpty(),
                 selfMid = profile.mid,
                 nameOf = LineRepository::nameOf,
                 pictureOf = LineRepository::pictureOf,
                 onBack = { openChatMid = null },
-                onSend = { text, replyTo -> LineRepository.send(screen.mid, text, replyTo) },
-                onMarkRead = { LineRepository.sendReadReceipt(screen.mid) },
+                onSend = { text, replyTo -> LineRepository.send(mid, text, replyTo) },
+                onMarkRead = { LineRepository.sendReadReceipt(mid) },
                 onOpenProfile = { openProfile = it },
-                onSendImage = { LineRepository.sendMedia(screen.mid, it) },
+                onSendImage = { LineRepository.sendMedia(mid, it) },
                 sendingImage = sendingImage,
                 mediaState = { media[LineRepository.mediaKey(it.id, preview = true)] },
                 onRequestMedia = { LineRepository.requestMedia(it, preview = true) },
                 onRetryMedia = { LineRepository.retryMedia(it, preview = true) },
                 onOpenMedia = { openMedia = it },
-                onReload = { LineRepository.reloadConversation(screen.mid) },
+                onReload = { LineRepository.reloadConversation(mid) },
                 reloading = reloadingChat,
                 onStatus = LineRepository::showStatus,
                 // Side by side both panes are on screen at once, and two hosts
@@ -398,6 +434,12 @@ private fun SignedIn(
         val windowWidth = maxWidth
 
         if (windowWidth >= TWO_PANE_MIN_WIDTH) {
+            // Both panes are already on screen, so there is no reveal to preview
+            // and back is a plain state change.
+            BackHandler(enabled = pane != null) {
+                if (openProfile != null) openProfile = null else openChatMid = null
+            }
+
             Row(Modifier.fillMaxSize()) {
                 listPane(
                     Modifier.width(
@@ -406,22 +448,63 @@ private fun SignedIn(
                 )
                 VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 Box(Modifier.weight(1f)) {
-                    detailPane(openProfile ?: openChat, true)
+                    detailPane(pane, true)
                 }
             }
         } else {
-            AnimatedContent(
-                targetState = openProfile ?: openChat,
+            // Seekable rather than fire-and-forget: the same transition a tap
+            // plays through is the one a back gesture scrubs by hand, so letting
+            // go part-way can rewind it instead of having to jump.
+            // Seeded with whatever is already open rather than with the list,
+            // so this settles where it starts.  Closing the viewer recomposes
+            // this branch from scratch (it early-returns above, disposing the
+            // whole thing), and from a null seed that arrives as a conversation
+            // sliding in over a list nobody navigated to.  Same for a restore
+            // after process death, where the open mid outlives the state here.
+            val paneState = remember { SeekableTransitionState(pane) }
+
+            LaunchedEffect(pane) {
+                if (paneState.targetState != pane) paneState.animateTo(pane)
+            }
+
+            // Where back lands: out of a profile opened from a conversation is
+            // that conversation, and out of anything else is the list.
+            val under: Pane? =
+                if (pane is Pane.Profile) openChatMid?.let(Pane::Chat) else null
+
+            PredictiveBackHandler(enabled = pane != null) { progress ->
+                try {
+                    progress.collect { paneState.seekTo(it.progress, under) }
+                    // Committed.  The animation is finished off the state it is
+                    // already seeking to, and only then is the selection cleared
+                    // — clearing first would restart this composable's effect
+                    // against a transition that has already arrived, which reads
+                    // as "no work to do" and leaves the pane frozen mid-swipe.
+                    paneState.animateTo(under)
+                    if (pane is Pane.Profile) openProfile = null else openChatMid = null
+                } catch (cancelled: CancellationException) {
+                    // The gesture was abandoned, so wind back to where it began.
+                    // Nothing to rethrow: the flow is cancelled on its own, not
+                    // as part of this coroutine going away.
+                    paneState.animateTo(paneState.currentState)
+                }
+            }
+
+            rememberTransition(paneState, label = "pane").AnimatedContent(
                 transitionSpec = {
-                    if (targetState != null) {
+                    // Going deeper slides the new pane over what was there;
+                    // coming back slides it off and eases the pane underneath
+                    // in from a slight parallax, so the two directions do not
+                    // look like the same push twice.
+                    if (targetState.depth() > initialState.depth()) {
                         slideInHorizontally { it } + fadeIn() togetherWith fadeOut()
                     } else {
-                        fadeIn() togetherWith slideOutHorizontally { it } + fadeOut()
+                        slideInHorizontally { -it / 4 } + fadeIn() togetherWith
+                            slideOutHorizontally { it } + fadeOut()
                     }
                 },
-                label = "screen",
-            ) { screen ->
-                if (screen != null) detailPane(screen, false) else listPane(Modifier)
+            ) { shown ->
+                if (shown != null) detailPane(shown, false) else listPane(Modifier)
             }
         }
     }

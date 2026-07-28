@@ -77,9 +77,16 @@ object LineRepository {
     private const val MEDIA_RETRY_DELAY_MS = 3_000L
     private const val MEDIA_RETRY_LIMIT = 4
 
-    /** Refresh cadence for the conversation currently on screen. */
-    private const val OPEN_CHAT_INTERVAL_MS = 3_000L
+    /**
+     * Refresh cadence for the conversation currently on screen — settable, so
+     * this is read per tick rather than held.  See [PollingInterval].
+     */
+    private val openChatIntervalMs: Long
+        get() = session.polling.millis(PollingInterval.OpenChatRefresh)
     private const val OPEN_CHAT_COUNT = 30
+
+    /** How often the refresh above looks to see whether it has been turned on. */
+    private const val OPEN_CHAT_IDLE_TICK_MS = 2_000L
 
     sealed interface AuthState {
         /** Before the stored token has been checked — the app shows a splash. */
@@ -202,7 +209,14 @@ object LineRepository {
         openChat.collectLatest { mid ->
             if (mid == null) return@collectLatest
             while (true) {
-                delay(OPEN_CHAT_INTERVAL_MS)
+                val pace = openChatIntervalMs
+                if (pace == 0L) {
+                    // Switched off.  Tick rather than return, so turning it back
+                    // on does not need the chat reopening.
+                    delay(OPEN_CHAT_IDLE_TICK_MS)
+                    continue
+                }
+                delay(pace)
                 val c = client ?: continue
                 runCatching { fetchMessages(c, mid, OPEN_CHAT_COUNT) }
                     .onFailure { Log.d(TAG, "open chat refresh failed: $it") }

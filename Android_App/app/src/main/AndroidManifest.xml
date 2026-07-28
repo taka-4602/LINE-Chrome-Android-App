@@ -8,9 +8,18 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- Predictive back is on by default from Android 15, which targetSdk 36
+         already opts into.  Declaring it explicitly is what extends the gesture
+         preview back to Android 13 and 14.  The catch is that on those two it
+         also switches back dispatch to the new API, which stops calling
+         Activity.onBackPressed() — safe here because nothing overrides it and
+         every back in the app goes through BackHandler / PredictiveBackHandler,
+         which route themselves either way.  Below Android 13 the flag is
+         ignored and back behaves exactly as it did. -->
     <application
         android:name=".LineApp"
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"

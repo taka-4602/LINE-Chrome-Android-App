@@ -12,6 +12,9 @@ class SessionStore(context: Context) {
 
     private val prefs = context.getSharedPreferences("line_session", Context.MODE_PRIVATE)
 
+    /** How often the poller does each of the things it does.  See [PollingSettings]. */
+    val polling = PollingSettings(prefs)
+
     var accessToken: String?
         get() = prefs.getString(KEY_ACCESS, null)
         set(v) = prefs.edit().putString(KEY_ACCESS, v).apply()
