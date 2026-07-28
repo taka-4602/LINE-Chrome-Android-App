@@ -3,13 +3,19 @@ package com.taka4602.line_chrome.ui
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.EnterExitState
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.FiniteAnimationSpec
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.SeekableTransitionState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.rememberTransition
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -43,11 +49,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -69,6 +78,7 @@ import com.taka4602.line_chrome.ui.screens.ProfileScreen
 import com.taka4602.line_chrome.ui.screens.SettingsScreen
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 
 /**
  * Where the panes split.
@@ -114,6 +124,58 @@ private fun Pane?.depth() = when (this) {
     is Pane.Chat -> 1
     is Pane.Profile -> 2
 }
+
+/** How long an untouched push or pop runs for. */
+private const val PANE_MS = 350
+
+/**
+ * How far the pane underneath trails the one sliding over it, as a divisor of
+ * the width.  A quarter is enough to read as depth without the two looking like
+ * they are on separate rails.
+ */
+private const val PANE_PARALLAX = 4
+
+/** How dark the covered pane goes once it is fully behind the one above it. */
+private const val PANE_DIM = 0.32f
+
+/**
+ * The shape of a pane transition, held deliberately straight.
+ *
+ * A [SeekableTransitionState] seeks by mapping its fraction onto playback time —
+ * `playTime = fraction * totalDuration` — and evaluating every child animation
+ * there.  So whatever curve lives in here is a curve a dragging finger has to
+ * fight, and the library defaults are springs: a spring covers almost all of its
+ * travel in the first third of its estimated duration and then spends the rest
+ * asymptotically settling within a one-pixel threshold.  Seeked by hand that
+ * reads as a pane which races ahead of the thumb, stalls for the back two thirds
+ * of the swipe, and jumps on release.  Worse, each spring estimates its own
+ * duration, so a fade and a slide in the same transition finish at different
+ * fractions and the outgoing pane can be fully transparent a third of the way
+ * across.
+ *
+ * Linear, and identical for every component, means fraction 0.5 is half way
+ * across for all of them at once.  The motion curve is not lost, only moved: it
+ * belongs to whatever drives the fraction, which is [PANE_MOTION] for a tap and
+ * the finger itself for a gesture.
+ */
+private fun <T> paneSpec(): FiniteAnimationSpec<T> = tween(PANE_MS, easing = LinearEasing)
+
+/** The curve a pane travels on when nothing is dragging it. */
+private val PANE_MOTION: FiniteAnimationSpec<Float> = tween(PANE_MS, easing = FastOutSlowInEasing)
+
+/**
+ * The curve a released gesture finishes on.  Shorter than [PANE_MOTION] and
+ * purely decelerating: the finger has already covered most of the distance, so
+ * this only has to carry the last of it and come to rest.
+ */
+private val PANE_SETTLE: FiniteAnimationSpec<Float> = tween(200, easing = LinearOutSlowInEasing)
+
+/**
+ * Raw back progress is linear in finger travel, which glues the pane to the
+ * thumb and runs it off screen well before the gesture has committed to
+ * anything.  This is the cubic Material curves its own predictive back with.
+ */
+private val PredictiveBackEasing = CubicBezierEasing(0.1f, 0.1f, 0f, 1f)
 
 @Composable
 fun AppRoot(pendingChatMid: String?, onPendingChatConsumed: () -> Unit) {
@@ -464,7 +526,7 @@ private fun SignedIn(
             val paneState = remember { SeekableTransitionState(pane) }
 
             LaunchedEffect(pane) {
-                if (paneState.targetState != pane) paneState.animateTo(pane)
+                if (paneState.targetState != pane) paneState.animateTo(pane, PANE_MOTION)
             }
 
             // Where back lands: out of a profile opened from a conversation is
@@ -472,21 +534,40 @@ private fun SignedIn(
             val under: Pane? =
                 if (pane is Pane.Profile) openChatMid?.let(Pane::Chat) else null
 
+            // Every animation a gesture leaves behind runs here rather than in
+            // the gesture's own coroutine.  PredictiveBackHandler cancels that
+            // coroutine outright — its cleanup does `channel.cancel()` *and*
+            // `job.cancel()` — both when the swipe is abandoned and when a
+            // second swipe starts on top of the first.  A suspending animateTo
+            // in a cancelled job throws at its first suspension point and never
+            // draws a frame, which is what leaves a pane stranded half way
+            // across the screen with nothing left running to finish it.
+            val paneScope = rememberCoroutineScope()
+
             PredictiveBackHandler(enabled = pane != null) { progress ->
                 try {
-                    progress.collect { paneState.seekTo(it.progress, under) }
+                    progress.collect {
+                        paneState.seekTo(PredictiveBackEasing.transform(it.progress), under)
+                    }
                     // Committed.  The animation is finished off the state it is
                     // already seeking to, and only then is the selection cleared
                     // — clearing first would restart this composable's effect
                     // against a transition that has already arrived, which reads
                     // as "no work to do" and leaves the pane frozen mid-swipe.
-                    paneState.animateTo(under)
-                    if (pane is Pane.Profile) openProfile = null else openChatMid = null
+                    // Both halves go to paneScope together so that a swipe
+                    // interrupting this one cannot land between them and strand
+                    // the selection open under a finished animation.
+                    paneScope.launch {
+                        paneState.animateTo(under, PANE_SETTLE)
+                        if (pane is Pane.Profile) openProfile = null else openChatMid = null
+                    }
                 } catch (cancelled: CancellationException) {
-                    // The gesture was abandoned, so wind back to where it began.
-                    // Nothing to rethrow: the flow is cancelled on its own, not
-                    // as part of this coroutine going away.
-                    paneState.animateTo(paneState.currentState)
+                    // Abandoned, so wind back to where it began.  Nothing to
+                    // rethrow: this coroutine is already cancelled, which is
+                    // exactly why the rewind is handed to paneScope.
+                    paneScope.launch {
+                        paneState.animateTo(paneState.currentState, PANE_SETTLE)
+                    }
                 }
             }
 
@@ -496,15 +577,57 @@ private fun SignedIn(
                     // coming back slides it off and eases the pane underneath
                     // in from a slight parallax, so the two directions do not
                     // look like the same push twice.
-                    if (targetState.depth() > initialState.depth()) {
-                        slideInHorizontally { it } + fadeIn() togetherWith fadeOut()
-                    } else {
-                        slideInHorizontally { -it / 4 } + fadeIn() togetherWith
-                            slideOutHorizontally { it } + fadeOut()
-                    }
+                    val deeper = targetState.depth() > initialState.depth()
+                    ContentTransform(
+                        targetContentEnter = slideInHorizontally(paneSpec()) {
+                            if (deeper) it else -it / PANE_PARALLAX
+                        },
+                        initialContentExit = slideOutHorizontally(paneSpec()) {
+                            if (deeper) -it / PANE_PARALLAX else it
+                        },
+                        // Depth alone decides what draws on top, which holds in
+                        // both directions because each pane keeps the z-index it
+                        // entered under.  Left at the default every pane sits at
+                        // zero and ties break by arrival order, so a pop paints
+                        // the arriving list over the conversation that is still
+                        // sliding off it.
+                        targetContentZIndex = targetState.depth().toFloat(),
+                        // Both panes fill the window, so there is no size to
+                        // animate — and the default would spring the container
+                        // and clip whichever pane is mid-slide.
+                        sizeTransform = null,
+                    )
                 },
             ) { shown ->
-                if (shown != null) detailPane(shown, false) else listPane(Modifier)
+                // Nothing fades: a pane that thins out on its way past shows the
+                // window behind it. Depth is carried by the one underneath going
+                // dark instead, which is also what stops the parallax from
+                // looking like two unrelated things moving at once.
+                //
+                // Whichever of the two panes is shallower is the covered one, in
+                // both directions — a push and a pop differ only in which of
+                // them is the one arriving.
+                val covered = shown.depth() <
+                    maxOf(paneState.currentState.depth(), paneState.targetState.depth())
+                val onScreen by transition.animateFloat(
+                    transitionSpec = { paneSpec() },
+                    label = "onScreen",
+                ) { if (it == EnterExitState.Visible) 1f else 0f }
+
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        // Read in the draw lambda, so scrubbing the dim costs a
+                        // redraw rather than a recomposition of the whole pane.
+                        .drawWithContent {
+                            drawContent()
+                            if (covered) {
+                                drawRect(Color.Black, alpha = (1f - onScreen) * PANE_DIM)
+                            }
+                        }
+                ) {
+                    if (shown != null) detailPane(shown, false) else listPane(Modifier)
+                }
             }
         }
     }
