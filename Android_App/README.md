@@ -21,13 +21,12 @@ Dark theme only. `minSdk` 24, `targetSdk` 36, Material 3.
 | Reply (long-press or double-tap) | working |
 | Copy / share a message | working |
 | Read receipts | manual only — never sent automatically |
-| Stickers | rendered from the sticker CDN |
-| Send images and video | working, unsealed chats only |
+| Stickers | received and rendered from the sticker CDN; sending not implemented |
+| Send images and video | working, unsealed chats only — see [Known limits](#known-limits) |
 | Receive images and video, sealed **and** unsealed | working, with thumbnails |
 | Receive audio and files | labelled `[Audio]` / `[File]`; not downloaded |
 | E2EE 1:1 — encrypt **and** decrypt | working |
-| E2EE group — decrypt | working |
-| E2EE group — encrypt | **not implemented**, see [Known limits](#known-limits) |
+| E2EE group — encrypt **and** decrypt | working, see [Letter sealing](#letter-sealing) |
 | Background polling + notifications | working, see [Message delivery](#message-delivery) |
 | Messages that arrived while the app was dead | delivered on next start |
 | Foldable / tablet two-pane layout | working |
@@ -167,6 +166,36 @@ as wanting them to know you read it — so `sendChatChecked` only goes out when 
 
 The ✓✓ button in the Chats tab clears **every** badge, also without telling LINE
 anything.
+
+## Letter sealing
+
+Whether a chat is sealed is the **recipient's** setting, not something the
+sender can see up front, so a text send goes out plain and is re-sent encrypted
+if the server answers `E2EE_RETRY_ENCRYPT` (82) — which is what LINE's own
+clients do. Passing `e2ee = true` skips straight to the encrypted path.
+
+1:1 and group chats seal differently:
+
+| | Key agreement | Version |
+|---|---|---|
+| 1:1 | pairwise ECDH — our private half against the peer's public half from `negotiateE2EEPublicKey` | whatever the negotiate call reports |
+| group | one shared key pair for the whole group; the group's **private** half against our own public half | always 2 — the shared key fixes it |
+
+A sealed group does no pairwise ECDH at all. The creator generates a single key
+pair and hands every member an encrypted copy of the private half, wrapped with
+ECDH(member key, creator key); `getLastE2EEGroupSharedKey` returns our copy and
+`groupSharedKey` unwraps it. Every member therefore derives the same secret,
+which is also why the same code path decrypts our own group messages.
+
+The version travels in `contentMetadata` as `e2eeVersion` rather than being
+assumed, because the recipient rebuilds the GCM AAD from it. Signing with one
+version while advertising another makes their tag check fail, and the message
+then shows as undecryptable on every device except the one that sent it.
+
+Group keys rotate whenever the membership changes, and the only signal that ours
+is stale is being refused with it — `[code=99] old group key`. There is nothing
+to check in advance, so a refusal drops the cached key, refetches, and retries
+once. Keys are cached in memory and under `.e2eeGroupKeys`, keyed by group MID.
 
 ## Media
 
@@ -420,16 +449,23 @@ Found here, and worth fixing in the Python client too:
 Inherited from the Python client, and documented at more length in
 [`LINE_Chrome_Python/README.md`](LINE_Chrome_Python/README.md):
 
-- **Sending to a letter-sealed group fails** with `[code=99] old group key`. The
-  plain send is refused outright rather than answered with `E2EE_RETRY_ENCRYPT`,
-  so there is no fallback to take. Group sealing needs `registerE2EEGroupKey`,
-  which neither client implements. Sealed groups can still be read.
+- **Media in a sealed chat is receive-only.** A sealed chat rejects a plain
+  upload exactly as it rejects plain text, and the encrypted-upload flow —
+  encrypting the file, then recording the namespace, object id and key material
+  in `contentMetadata` — is not implemented either side. Sealed images and video
+  sent from other clients are downloaded and decrypted normally; only sending
+  into a sealed chat is limited to text. Text itself, 1:1 and group, is fine —
+  see [Letter sealing](#letter-sealing).
 - Messages this client sends may show "can't be decrypted" on your other devices.
   It signs with the key id lifted from the key chain rather than registering its
   own via `registerE2EEPublicKey`. Not fully diagnosed.
-- Key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's current
-  key, so messages predating a rotation stay unreadable. Keys are cached to limit
-  future loss; they cannot be recovered retroactively.
+- Peer key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's
+  current key, so 1:1 messages predating a rotation stay unreadable. Keys are
+  cached by key id to limit future loss; they cannot be recovered retroactively.
+  Group keys are the same story and slightly worse: `getLastE2EEGroupSharedKey`
+  takes a group MID and a key version but no key id, so it only ever answers with
+  the current key, and the on-disk copy holds one key per group. Messages sealed
+  before a membership change are unreadable once the group has rotated.
 - The chat list costs one `getRecentMessagesV2` per chat, eight at a time, since
   LINE has no call that returns it directly. Fine for tens of chats, slow for
   hundreds.
