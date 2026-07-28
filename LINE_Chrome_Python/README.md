@@ -1,479 +1,378 @@
-# LINE Chrome (Android)
+# line_chrome
 
-A Kotlin/Compose Android client for LINE, built on a port of the
-[`LINE_Chrome_Python`](LINE_Chrome_Python/) wrapper in this repo. It speaks
-LINE's Apache Thrift protocol directly and signs in as a desktop client
-(`DESKTOPWIN`), so it gets a real multi-device session alongside your phone —
-including end-to-end encryption (letter sealing).
+A pure-Python LINE client. It speaks the same Apache Thrift protocol as LINE's
+desktop/Chrome clients, so it gets a real multi-device session — including
+end-to-end encryption (letter sealing) for both sending and receiving.
 
-Dark theme only. `minSdk` 24, `targetSdk` 36, Material 3.
+```python
+from line_chrome import LINE
+
+line = LINE("you@example.com", "password")     # PIN confirmation on first run
+line.send_message("ue8790ab5...", "こんにちは")  # sealed automatically if needed
+
+@line.on_message
+def on_msg(msg, op):
+    print(f"{msg.sender}: {msg.text}")         # already decrypted
+
+line.listen()
+```
+
+It is a library, not an application: the package is the whole project, and
+there is no CLI or entry-point script.
 
 ## Status
 
 | Area | State |
 |---|---|
-| Email + password login, PIN confirmation, device cert | working |
-| Session resume, token rotation, unattended re-login | working |
-| Chat list (1:1 and group) with last message | working |
-| Friend list, group list, search | working |
-| Profile page (tap the conversation header) | working |
-| Conversation view, send / receive text | working |
-| Reply (long-press or double-tap) | working |
-| Copy / share a message | working |
-| Read receipts | manual only — never sent automatically |
-| Stickers | received and rendered from the sticker CDN; sending not implemented |
-| Send images and video | working, unsealed chats only — see [Known limits](#known-limits) |
-| Receive images and video, sealed **and** unsealed | working, with thumbnails |
-| Receive audio and files | labelled `[Audio]` / `[File]`; not downloaded |
+| Email + password login, device cert, session resume | working |
+| Send / receive plain text | working |
 | E2EE 1:1 — encrypt **and** decrypt | working |
-| E2EE group — encrypt **and** decrypt | working, see [Letter sealing](#letter-sealing) |
-| Background polling + notifications | working, see [Message delivery](#message-delivery) |
-| Messages that arrived while the app was dead | delivered on next start |
-| Foldable / tablet two-pane layout | working |
-| Light theme | deliberately absent |
+| E2EE group / room — encrypt **and** decrypt | working |
+| Long-polling (`listen`) | implemented, lightly tested |
+| Send media (image / video / audio / file) — unsealed chats | working |
+| Send media — sealed chats | **not implemented** — needs the encrypted-media flow |
+| Download media, including from sealed chats | working |
+| Upload of large files | untested — a chunked/range upload is not implemented |
 
-## Architecture
+## Install
 
-```
-line/            protocol layer — a direct port of the Python client
-  Thrift.kt        TBinary / TCompact encode + decode
-  Crypto.kt        SHA-256, AES-ECB/CBC/CTR/GCM, HKDF, RSA, Curve25519
-  XxHash32.kt      the 4-byte MAC legy wants on encrypted bodies
-  Legy.kt          LINE's body-encryption proxy (auth traffic)
-  ObsParams.kt     object-storage URLs and the X-Obs-Params JSON
-  LineClient.kt    login, TalkService calls, polling, letter sealing, media
-  LineTypes.kt     Message, Contact, Chat, Operation, enums
-  E2eeStore.kt     on-disk key material, same layout as the Python client
-data/            LineRepository (single source of UI state)
-                 SessionStore (tokens) + CredentialStore (keystore-encrypted)
-service/         PollingService (foreground) + Notifier
-ui/              Compose screens, dark-only Material 3 theme
+There is no `requirements.txt` and no packaging metadata — drop the
+`line_chrome/` directory next to your script, or put its parent on
+`PYTHONPATH`, and install the dependencies yourself:
+
+```bash
+pip install "httpx[http2]" requests rsa pycryptodome cryptography xxhash
 ```
 
-`LineRepository` is a process-wide singleton because the polling service and the
-Activity have to share one message store, and a session can cost a PIN
-confirmation to rebuild.
+Python 3.9+. `cryptography` must be new enough to have
+`X25519PrivateKey.private_bytes_raw()` (42.0+); developed against 3.11 with
+`cryptography` 46.
 
-### Why BouncyCastle
+## Quick tour
 
-Two things rule out the platform providers:
+```python
+from line_chrome import LINE, LineServiceError
 
-- `KeyAgreement.getInstance("XDH")` for Curve25519 only exists from API 33, and
-  `minSdk` here is 24.
-- LINE uses a **16-byte** AES-GCM nonce. Conscrypt accepts only 12 and throws
-  otherwise, so message encryption goes through BouncyCastle's lightweight
-  `GCMBlockCipher`.
+line = LINE("you@example.com", "password")
+print(line.mid)                                  # own MID, set at login
+
+for s in line.get_chat_summaries():              # the "Chats" tab
+    print(f"{s.name:24} {s.sender_name or '':12} {s.preview}")
+
+line.send_message("c1234...", "hello")
+line.send_image("c1234...", "icon.png")
+
+for m in line.get_recent_messages("c1234...", count=20):
+    print(m.sender, m.text)                      # decrypted where possible
+```
+
+Every server-side failure raises `LineServiceError`, which carries `.code` and
+`.message`. Codes matter: `82` is `E2EE_RETRY_ENCRYPT` (handled internally by
+`send_message`), `89` is a rejected E2EE secret during login.
 
 ## Logging in
 
-Email and password, then a six-digit code shown in the app that you approve in
-LINE on your phone. That confirmation is what hands over the E2EE key chain, so
-it is not optional if you want sealed chats to work — and it only happens once,
-because the device certificate is cached afterwards.
+```python
+line = LINE("you@example.com", "password")   # first run: PIN on your phone
+line = LINE(auth_token="...")                # subsequent runs
+```
 
-There is also an "advanced" field that accepts an existing access token (for
-example one the Python client obtained). A token carries no E2EE key, so sealed
-chats stay unreadable until you sign in with a password at least once.
+Tokens rotate on their own via the `x-line-next-access` response header;
+`line.refresh_token()` forces it using the stored refresh token.
 
-Signing out deletes the stored key. Messages sealed with it become unreadable
-and the next sign-in needs another PIN.
+The first login prints a pincode (default `202202`) that you type into the LINE
+app on your phone. That device confirmation is what hands over the E2EE key
+chain, so it is not optional if you want sealed chats to work.
 
-### Staying signed in
+Afterwards several things are cached beside the package, **not** in the current
+directory — so the script works no matter where it is launched from:
 
-LINE expires the v3 access token every few days —
-`[code=8] V3_TOKEN_CLIENT_LOGGED_OUT` — and the refresh token eventually goes
-with it, so a client that only stores tokens keeps dropping out. With **Stay
-signed in** ticked at login, recovery is automatic and happens in three steps:
+| Path | Contents |
+|---|---|
+| `.data/<email>.crt` | device cert; later logins skip the PIN |
+| `.e2eeKeys/` | your E2EE private key (`key_<id>.json`, `<mid>.json`) |
+| `.e2eePublicKeys/`, `.e2eeGroupKeys/` | cached peer and group keys |
+| `.tokens/`, `.refreshToken/` | rotated access tokens |
 
-1. renew with the refresh token, which is cheap and usually enough;
-2. failing that, log in again with the stored email and password — normally
-   **without a PIN**, because the device certificate from the first login is
-   still on disk;
-3. failing that, surface the login screen.
+Treat `.e2eeKeys/` as a secret: it can decrypt your messages. Losing it costs
+another PIN confirmation, because LINE only ever hands the key out during a
+device registration.
 
-This runs in the background too, so a session that dies while the app is closed
-is rebuilt and notifications keep arriving. **Settings → Sign-in** has a switch:
-turning it off keeps the password but stops it being used, while *Forget saved
-password* deletes it outright.
+```python
+LINE(email, password, save_path="/somewhere/else", pincode="123456")
+```
 
-The password is encrypted with an AES key generated inside the **Android
-keystore**, so the ciphertext in SharedPreferences is useless without a key that
-cannot be extracted from the device. Signing out deletes it.
+## API
 
-Recovery is serialised behind a mutex with a 30s grace window, and **failures
-are cached alongside successes**: several loops tend to notice the same dead
-session at once, and a wrong password that re-attempted `loginV2` on every call
-would be a login storm — precisely the request volume that gets an account
-flagged.
+Everything returns typed `NamedTuple`s from `line_chrome.types` — `Profile`,
+`Contact`, `Chat`, `ChatSummary`, `Message`, `Location`, `Operation`,
+`SendMessageResult` — alongside the int-constant enums `OpType`, `MIDType`,
+`ContentType`, `ChatType` and `MessageRelationType`. All of them are re-exported
+from the package root.
 
-Only a real rejection reaches the login screen. A wrong password or a demand for
-a PIN needs the user; a timeout does not, so a network failure leaves the UI
-alone and hands off to a watchdog that retries in the background, backing off
-from 15s to a 5-minute ceiling. Coming back from a tunnel therefore costs
-nothing, while a genuinely wrong password stops being retried almost at once.
+### Chats and contacts
 
-## Layout
+```python
+line.get_profile()                      # -> Profile
+line.get_chats()                        # -> [Chat]   groups and rooms
+line.get_chats(include_peers=True)      # ...plus one per contact
+line.get_chat_mids(include_peers=True)  # -> [mid], no Chat lookup
+line.get_all_contact_ids()              # -> [mid]
+line.get_contacts(mids)                 # -> [Contact]
+line.get_contact(mid)                   # -> Contact, works for non-friends too
+line.find_contact_by_userid("handle")   # -> Contact, by @LINE ID (unverified)
+line.get_chat_summaries()               # -> [ChatSummary]  the "Chats" tab
+```
 
-Under 600dp wide the app is a single pane, and opening a conversation covers the
-list. At or above it the list and the conversation sit side by side — a Fold's
-inner screen is about 670dp and its cover screen about 340dp, so the two states
-fall cleanly either side.
+`get_chats()` and `get_contacts()` chunk their MID lists (`chunk_size=200`),
+because the request carries the whole list in one struct and a large friend
+list would otherwise overflow it.
 
-The test is on **width**, not on whether the device folds, so an ordinary phone
-turned landscape gets the two-pane layout too.
+`getAllChatMids` only returns groups and rooms. A 1:1 chat has no room object
+server-side — it is addressed by the peer's own MID — so direct chats come from
+the contact list instead. `get_chat_summaries()` merges both and attaches each
+chat's last message, newest first:
 
-The Chats/Friends/Settings bar belongs to the list rather than to the window, so
-it stays under the list in both layouts — the whole left-hand side is one
-`Scaffold` either way, just narrower when a conversation sits beside it.
+```python
+for s in line.get_chat_summaries(include_peers=True, include_empty=False,
+                                 max_workers=8):
+    print(s.name, s.sender_name, s.preview, s.timestamp)
+```
 
-Navigation state is held in `rememberSaveable` and keyed by MID alone, because
-folding, unfolding and rotating all recreate the Activity. Losing the open
-conversation on every fold would be miserable, and deriving the name and picture
-from the MID means they stay current if a contact is renamed.
+`ChatSummary` flattens the two places a name can live (a group's `chat_name`
+versus a peer's contact name) into `.name`, and `.preview` renders the one-line
+body the official client shows — `[Sticker]` for non-text, `[Encrypted]` when
+the ciphertext could not be opened. `.sender_name` is `"You"` for your own
+messages, and group senders who are not in your contact list are resolved in one
+extra batch so previews show a name rather than a raw MID.
 
-## Profiles
+There is no LINE call that returns this list directly; the official client keeps
+a local message box synced from `fetchOps`. This issues one
+`getRecentMessagesV2(count=1)` per chat, concurrently — fine for tens of chats,
+noticeable for hundreds.
 
-Tapping the name and picture at the top of a conversation opens a profile page:
-avatar, display name, status message, a copyable MID, and a button to open the
-chat. In a group, tapping a sender's avatar opens theirs, and the Friends tab
-opens a profile rather than jumping straight into a conversation — it is a
-directory, and looking someone up is as likely as wanting to message them.
+### Messages
 
-Person profiles come from `getContactsV2` and refresh on open; cached details
-render first so the page never appears empty. Groups have no contact record and
-the protocol exposes **no roster call at all**, so a group page shows what the
-chat list knows plus the people who have actually spoken in the messages loaded.
-That list is labelled as such rather than passed off as the membership.
+```python
+line.send_message(to, "hello")                     # seals if the chat requires it
+line.send_message(to, "hi", reply_to=message_id)
+line.send_message(to, "hi", e2ee=True)             # force sealing
+line.send_message(to, text, content_type=7)        # 7=STICKER, 9=GIFT, 13=CONTACT…
+line.get_recent_messages(chat_mid, count=20)       # -> [Message], decrypted
+line.unsend_message(message_id)
+line.send_read_receipt(chat_mid, message_id)
+```
 
-## Replies
+MID prefixes: `u` user, `c` group, `r` room.
 
-Long-press a message for a menu — Reply, plus Copy and Share when there is text
-— or double-tap to reply straight away. Both work on text, images, video and
-stickers. A reply carries the original's id in field 21 with
-`messageRelationType = REPLY`, which `ThriftTest` pins byte-for-byte against the
-reference client.
+`send_message` returns a `SendMessageResult`; the created message — and so its
+id, for a later `unsend_message` or `reply_to` — is at `.message`.
 
-Incoming replies render the quoted original inside the bubble. Only the recent
-window of a conversation is held, so a reply reaching further back says the
-original is not loaded rather than drawing an empty quote.
+A `Message` carries `id`, `sender`, `to`, `to_type`, `created_time` (ms epoch),
+`text`, `content_type`, `content_metadata`, `has_content`, `location`,
+`related_message_id`, `relation_type` and `chunks` (the raw E2EE ciphertext when
+the message is sealed). Note that LINE sends plain text as `ContentType.NONE`
+(0), so `ContentType.TEXT` is 0 as well; `ContentType.name(v)` gives a human
+label.
 
-## Read receipts
+`Contact` and `Profile` expose `.picture_url()` / `.picture_url(preview=True)`,
+since `picture_path` comes back CDN-relative and the API never sends the host.
+`Contact.name` picks your nickname for someone over their own display name.
 
-Opening a chat clears its unread badge locally and tells LINE nothing. A read
-receipt is visible to the other party, and glancing at a message is not the same
-as wanting them to know you read it — so `sendChatChecked` only goes out when the
-✓ button in the chat's top bar is pressed.
+### Media
 
-The ✓✓ button in the Chats tab clears **every** badge, also without telling LINE
-anything.
+```python
+line.send_image(to, "icon.png")                   # path, URL or bytes
+line.send_video(to, "clip.mp4", duration=15000)   # duration in ms
+line.send_file(to, "doc.pdf")
+line.send_media(to, data, "audio")                # image/video/audio/file/gif
 
-## Letter sealing
+line.download_image(msg)                          # -> bytes, decrypted if sealed
+line.download_image(msg, path="out.jpg")
+line.download_image(msg, preview=True)            # thumbnail
+line.download_image(msg, size="m800x1200")        # or "w800"; plain media only
+```
 
-Whether a chat is sealed is the **recipient's** setting, not something the
-sender can see up front, so a text send goes out plain and is re-sent encrypted
-if the server answers `E2EE_RETRY_ENCRYPT` (82) — which is what LINE's own
-clients do. Passing `e2ee = true` skips straight to the encrypted path.
-
-1:1 and group chats seal differently:
-
-| | Key agreement | Version |
-|---|---|---|
-| 1:1 | pairwise ECDH — our private half against the peer's public half from `negotiateE2EEPublicKey` | whatever the negotiate call reports |
-| group | one shared key pair for the whole group; the group's **private** half against our own public half | always 2 — the shared key fixes it |
-
-A sealed group does no pairwise ECDH at all. The creator generates a single key
-pair and hands every member an encrypted copy of the private half, wrapped with
-ECDH(member key, creator key); `getLastE2EEGroupSharedKey` returns our copy and
-`groupSharedKey` unwraps it. Every member therefore derives the same secret,
-which is also why the same code path decrypts our own group messages.
-
-The version travels in `contentMetadata` as `e2eeVersion` rather than being
-assumed, because the recipient rebuilds the GCM AAD from it. Signing with one
-version while advertising another makes their tag check fail, and the message
-then shows as undecryptable on every device except the one that sent it.
-
-Group keys rotate whenever the membership changes, and the only signal that ours
-is stale is being refused with it — `[code=99] old group key`. There is nothing
-to check in advance, so a refusal drops the cached key, refetches, and retries
-once. Keys are cached in memory and under `.e2eeGroupKeys`, keyed by group MID.
-
-## Media
-
-### Sending
-
-The photo and video buttons in the composer open the system picker — no storage
-permission is involved, since the picker hands over just the one item chosen.
-GIFs go up as `type=image` with `cat=original`, or LINE transcodes the animation
-away; video carries its duration, read from `MediaMetadataRetriever`.
+`preview=True` is a flag rather than a `size` value because plain and sealed
+media address the thumbnail completely differently — a `/preview` path segment
+versus a separate `<OID>__ud-preview` object. `size` is ignored (with a warning)
+for sealed media, which is not resizable server-side.
 
 There is no "attach a file to a message" call. The recipient travels in the
-upload parameters as `tomid`, so **the upload itself creates the message**.
-Nothing is appended locally: the conversation is polled for up to 8s afterwards,
-because the message is not in the message box the instant the upload returns.
+upload params as `tomid`, so **the upload itself creates the message** — the
+send functions return `{"objectId": ..., "hash": ...}` rather than a `Message`.
 
-Three things here are easy to get wrong, two of them inherited:
+Uploads go to the **gateway** (`gwz.line.naver.jp/oa/r/talk/m/reqseq`), not to
+`obs.line-apps.com` as the config domain suggests. Any device type other than
+`CHROMEOS` must trade its auth token via `acquireEncryptedAccessToken` and use
+the part after the `\x1e` separator as `X-Line-Access`; the plain token is
+rejected. This client identifies as `DESKTOPWIN`, so it always takes that path.
 
-- the upload goes to the **gateway** (`gwz.line.naver.jp/oa/r/talk/m/reqseq`),
-  not to `obs.line-apps.com` as the config domain suggests;
-- any device type other than `CHROMEOS` must trade its auth token via
-  `acquireEncryptedAccessToken` and use the part after the `0x1E` record
-  separator — the plain token is rejected;
-- `X-Obs-Params` is base64 of JSON, and Python's `json.dumps` defaults to `", "`
-  separators **and** `ensure_ascii=True`. The second matters: a Japanese filename
-  would otherwise travel as raw UTF-8 inside an HTTP header. `obsParamsJson`
-  reproduces both and `ObsParamsTest` pins it.
+Downloads are keyed differently depending on sealing, which is easy to get
+wrong:
 
-Uploads are buffered whole in memory, so anything over 25MB (images) or 60MB
-(video) is refused up front rather than risking the heap mid-send.
+| | URL | extra header |
+|---|---|---|
+| plain | `/oa/r/talk/m/<messageId>` | — |
+| sealed | `/oa/r/talk/<SID>/<OID>` | `X-Talk-Meta` |
+
+For sealed media the object is **not** under `talk/m` and is not keyed by the
+message id at all — the sender records the real namespace and object id in
+`contentMetadata` as `SID` (`emi`/`emv`/`ema`/`emf`) and `OID`. The fetch also
+needs an `X-Talk-Meta` header: base64(json) wrapping a base64 TBinary struct
+holding the message id at field 4.
+
+The object itself is then decrypted with key material carried in the message:
+HKDF-SHA256 (`info=b"FileEncryption"`) → encKey/macKey/nonce, AES-CTR, with a
+trailing 32-byte HMAC to strip.
+
+Sending to a sealed chat is not implemented — LINE rejects plain uploads there
+exactly as it rejects plain text.
+
+`send_message` sends plain first and, if the server answers
+`E2EE_RETRY_ENCRYPT` (82), transparently re-sends encrypted. That mirrors the
+official clients: whether a chat is sealed is the *recipient's* setting and is
+not knowable up front.
 
 ### Receiving
 
-Attachments are not carried in the message — they live in object storage keyed by
-message id, so a thumbnail is fetched lazily as each bubble first appears (three
-at a time) and cached under `filesDir/media`.
+```python
+@line.on_message
+def handler(msg, op): ...    # RECEIVE_MESSAGE only, decrypted
 
-Thumbnails are addressed differently depending on whether the chat is sealed, and
-this is the part that catches people out:
+@line.on_op
+def any_event(op): ...       # every operation
 
-| | Original | Thumbnail |
-|---|---|---|
-| plain | `/oa/r/talk/m/<messageId>` | `…/<messageId>/preview` |
-| sealed | `/oa/r/talk/<SID>/<OID>` | `…/<SID>/<OID>__ud-preview` |
-
-A sealed thumbnail is a **separate object**, not a path variant — the server
-cannot resize what it cannot read, which is also why a dimension string like
-`m800x1200` applies to plain media only. Asking for `<SID>/<OID>/preview` does
-not fail; it returns an empty 200, which shows up as a blank bubble rather than
-an error. `MediaUrlTest` pins all six combinations.
-
-An empty response is never treated as success. Where a thumbnail genuinely is not
-there, an image falls back to the original and lets Coil scale it — filing the
-bytes under both keys so opening it costs no second download — while a video
-shows a play badge instead, since pulling a whole clip down to draw a 220dp
-bubble would be absurd and could not be rendered as a still anyway. A freshly
-uploaded object has no thumbnail for a second or two, so a failure on a message
-less than two minutes old is retried a few times.
-
-Tapping opens the original: images full-screen in-app, video handed to whatever
-the device already plays video with, through a `FileProvider` grant.
-
-In a **sealed** chat the object is encrypted, lives under the namespace and
-object id the sender recorded in `contentMetadata`, and the fetch must be
-authorised with an `X-Talk-Meta` header — base64 of JSON wrapping a base64
-TBinary struct. The file itself is AES-CTR under HKDF-SHA256
-(`info="FileEncryption"`) of key material that only exists inside the decrypted
-message body, with an appended HMAC that is stripped only when it verifies.
-
-`MediaCryptoTest` pins the HKDF derivation, the CTR keystream, the MAC check and
-the `X-Talk-Meta` bytes against the Python client — a wrong derivation decodes to
-noise and says nothing about why.
-
-## Message delivery
-
-There is no push channel — LINE delivers through its own app, not ours — so the
-client polls in a foreground service. That is why there is a permanent
-low-priority "Connection" notification; Android will not keep a long-lived socket
-alive otherwise.
-
-**The working route is `/P3` + `fetchOperations`**, established by probing a live
-DESKTOPWIN session. Neither reference implementation gets this right for this
-device type:
-
-| Endpoint | Method | Result on a live account |
-|---|---|---|
-| `/P3` | `fetchOperations` | **works** — what this client uses |
-| `/P4` | `fetchOperations` | rejected |
-| `/P5` | `fetchOps` | what CHRLINE uses; replies in TMoreCompact, no decoder here |
-| `/P4` | `fetchOps` | what the Python client uses; `invalid method name: "fetchOps"` |
-
-That last row is why the Python client's `listen()` never worked despite being
-marked only "lightly tested": `/P4` speaks TCompact perfectly well, it just does
-not host that method, and the error was being swallowed by the decoder.
-
-The client still probes the list in order rather than hard-coding `/P3`, so a
-future move gets diagnosed instead of silently breaking. **Settings → Connection**
-shows the route in use.
-
-`/P3 fetchOperations` is a **short-poll**: it answers immediately with an empty
-list when nothing has happened, rather than holding the request open. That is
-fine, just not a long-poll — but it has to be detected rather than assumed, since
-a genuine long-poll also returns quickly when there is a backlog. Three
-consecutive empty answers inside a second is the signal; after that the calls are
-spaced 5s apart instead of hammering, which is close enough to live and well
-clear of the request rate that
-[gets accounts banned](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1).
-A 2s floor applies either way, so no endpoint can make the loop spin.
-
-### The safety net
-
-Delivery does not depend on any of that working. A poll with nothing to say and
-one that is silently broken look identical from the client — both just sit there
-— so instead of trying to tell them apart, the service also checks on a timer,
-always:
-
-- every 25s it calls `getLastOpRevision`, a **single** request that says whether
-  the account moved at all;
-- only when it has does it pay for the per-chat sweep;
-- and it stands down entirely while the poll is visibly delivering — any op in
-  the last 60s — so a healthy connection costs almost nothing.
-
-That cheap revision check matters: LINE
-[bans accounts that poll hard](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1),
-so a naive per-chat sweep on a timer would not be safe.
-
-On top of that, the conversation on screen is re-fetched every 3s. It costs one
-request and stops the moment the app is backgrounded, so it buys fresher messages
-where they are being read without adding steady background load.
-
-**Settings → Connection** shows when the safety net last ran, which is the
-quickest way to tell whether background delivery is alive.
-
-### Across process death
-
-The last message id seen in each chat is written to disk, not just held in
-memory. Without that a restarted process cannot tell a backlog from a first
-sweep, and the only safe reading of "every chat looks new" is to stay quiet —
-so anything that arrived while the app was dead used to vanish silently. With
-the ids persisted the first sweep after a restart knows exactly which messages
-are genuinely new and notifies for those alone.
-
-### When the poll is down
-
-Delivery falls back rather than stopping. The service keeps messages moving over
-plain TalkService refreshes every 10s, stays there for 10 minutes, and only then
-re-probes the candidate list — deliberately *not* between every refresh, because
-a single hung candidate costs minutes and starves the fallback it was meant to
-be checking on.
-
-A failure that is really a **dead token** is caught before any of that: the
-session is rebuilt and the poll resumes, since dropping to the fallback would
-only fail the same way.
-
-While degraded, the app shows a banner reading "Live updates unavailable —
-checking periodically instead"; tapping expands the per-candidate probe results
-and long-pressing copies them. The service notification reads "Checking every
-10s", and **Settings → Connection** carries the same detail behind a Copy
-button. So does logcat:
-
-```bash
-adb logcat -s PollingService:* LineClient:*
+line.listen()                # blocks; Ctrl-C to stop
 ```
 
-### Notifications
+`listen()` seeds from `line.get_last_op_revision()` so it starts at the present
+rather than replaying the account's history, then long-polls `fetchOps` on `/P4`.
+Handlers run on daemon threads by default; pass `threaded=False` for
+sequential dispatch. A handler that raises is logged, not fatal.
 
-One notification per chat, `MessagingStyle`, so a busy conversation stacks its
-last few lines instead of replacing them. Tapping opens that chat; opening it in
-the app dismisses it. **Settings → Notify on new messages** turns them off
-without touching the connection.
+`Operation` exposes `revision`, `created_time`, `op_type` (an `OpType`
+constant), `req_seq`, `param1`–`param3` and `message`.
 
-Announced message ids are remembered per chat — 64 of them, a few minutes' worth
-— and that check lives in the notifier rather than in each caller. There is more
-than one route to the same message: a redelivered op, or a safety-net sweep that
-was already in flight when the poll delivered it. Each sender dedupes its own
-path, but only the notifier sees all of them, and a second post under the same id
-re-alerts rather than stacking — one notification that made the sound twice.
+### E2EE internals
 
-### Stopping it
-
-**Quit app**, at the bottom of Settings, stops the service and exits. It is the
-only way to put the connection down without signing out, because Android does not
-let you dismiss a foreground service notification.
-
-`PollingService.stop` goes through `stopService` rather than delivering itself an
-intent: that clears the started state at the framework, so `START_STICKY` does
-not resurrect the service the moment the process exits.
-
-### Foreground service type
-
-None of the documented types fits a third-party messaging client, so the choice
-is between bad options. `dataSync` sounds closest but is **budgeted at six hours
-a day** on Android 14+, after which the system stops the service and messages
-simply stop arriving until the app is reopened — and there is no push channel to
-cover the gap, because LINE delivers through its own app. A messaging connection
-cannot be part-time, so the service is declared **`specialUse`** with a
-`PROPERTY_SPECIAL_USE_FGS_SUBTYPE` explaining why.
-
-`specialUse` is not supposed to carry a runtime budget, but `onTimeout` is
-implemented anyway (Android 15+): if the platform ever does time the service out,
-it stops cleanly and the banner reads "Background time limit reached — reopen the
-app". Ignoring that callback does not buy more time — it gets the process killed
-outright with `RemoteServiceException`, which loses the connection and takes the
-app down with it.
-
-Note that `specialUse` is a declaration Google Play reviews for Play Store
-distribution.
-
-## Tests
-
-```bash
-./gradlew :app:testDebugUnitTest
+```python
+line.e2ee_key                       # our key: {keyId, privKey, pubKey, e2eeVersion}
+line.get_e2ee_public_keys()         # every key registered on the account
+line.negotiate_e2ee_public_key(mid) # a peer's current key
+line.decrypt_message(msg)           # usually unnecessary; done automatically
 ```
 
-83 unit tests, and they are worth keeping. The Thrift, crypto and media vectors
-are byte-for-byte outputs of the Python reference implementation running on the
-same inputs — LINE ships no IDL, and none of this fails loudly at runtime. A
-wrong shared secret just makes every other device report your messages as
-undecryptable; a wrong legy MAC gets an empty HTTP 200 with no explanation.
+## How it works
 
-| Suite | Covers |
-|---|---|
-| `ThriftTest` | TCompact/TBinary encoding against Python output |
-| `CryptoTest` | X25519, AES-GCM with a 16-byte nonce, legy bodies |
-| `MediaCryptoTest` | HKDF, AES-CTR, the media MAC, `X-Talk-Meta` |
-| `MediaUrlTest` | plain vs sealed object addressing, all six cases |
-| `ObsParamsTest` | `X-Obs-Params` framing, including non-ASCII filenames |
-| `CredentialBlobTest` | login field framing, ASCII and non-ASCII |
-| `BatchBackoffTest` | MID batch back-off on `INVALID_LENGTH` |
-| `XxHash32Test` | the legy body MAC |
-| `MessageOrderTest`, `MessageMergeTest`, `StickerTest` | UI-facing message rules |
+Requests carry `X-Line-Application: DESKTOPWIN\t8.6.0.3277\tWINDOWS\t...`, so
+LINE treats the client as a desktop app — which, unlike a phone, is allowed to
+hold a concurrent session.
 
-To regenerate a vector, run the equivalent call in `LINE_Chrome_Python` and
-compare hex.
+- **Auth** — `/api/v3p/rs` over the legy encryption proxy (`gf.line.naver.jp/enc`,
+  AES-CBC + RSA-OAEP key wrap), TBinary.
+- **Talk** — `/S4`, TCompact, plain HTTPS to `gwz.line.naver.jp`.
+- **Poll** — `/P4`, TCompact. (`/P5` is the TMoreCompact variant and needs a
+  decoder this library does not have.)
+- **Objects** — `/oa/r/talk/m/reqseq` on the same gateway, raw bytes with a
+  base64 `X-Obs-Params` header.
+- **Login** — RSA-encrypted credentials → `loginV2` → PIN → `/LF1` long-poll →
+  key chain → `confirmE2EELogin` → `loginV2` → v3 token.
 
-## Known limits
+### Letter sealing
 
-Found here, and worth fixing in the Python client too:
+1:1 uses ECDH between your key and the peer's, per message:
 
-- **The login blob length prefix counts characters upstream, bytes here.**
-  `_rsa_encrypt` frames each credential field with `chr(len(value))`, a character
-  count. For ASCII the two agree, so an English account never notices — but a
-  Japanese password declares 6 where it sends 16 and the login is rejected.
-  `CredentialBlobTest` pins both cases.
-- **MID batch sizes are found by backing off, not hard-coded.** `getChats` and
-  `getContactsV2` take the whole list in one struct and answer
-  `[code=6] Invalid Length` when it is too long, without saying what the limit is.
-  The reference client's fixed 200 works only for a small account; a few hundred
-  contacts and the friend list never loads at all. This port starts at 100 and
-  halves until the server accepts.
+```
+shared  = X25519(our_private, peer_public)
+gcmKey  = SHA256(shared ‖ salt ‖ "Key")
+aad     = to ‖ from ‖ senderKeyId ‖ recvKeyId ‖ specVersion ‖ contentType
+chunks  = [salt, AES-256-GCM(gcmKey, nonce, json, aad), nonce, sKid, rKid]
+```
 
-Inherited from the Python client, and documented at more length in
-[`LINE_Chrome_Python/README.md`](LINE_Chrome_Python/README.md):
+specVersion 2 is AES-GCM as above; version 1 is the older AES-CBC form, which
+this client can still decrypt.
 
-- **Media in a sealed chat is receive-only.** A sealed chat rejects a plain
-  upload exactly as it rejects plain text, and the encrypted-upload flow —
-  encrypting the file, then recording the namespace, object id and key material
-  in `contentMetadata` — is not implemented either side. Sealed images and video
-  sent from other clients are downloaded and decrypted normally; only sending
-  into a sealed chat is limited to text. Text itself, 1:1 and group, is fine —
-  see [Letter sealing](#letter-sealing).
-- Messages this client sends may show "can't be decrypted" on your other devices.
-  It signs with the key id lifted from the key chain rather than registering its
-  own via `registerE2EEPublicKey`. Not fully diagnosed.
-- Peer key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's
-  current key, so 1:1 messages predating a rotation stay unreadable. Keys are
-  cached by key id to limit future loss; they cannot be recovered retroactively.
-  Group keys are the same story and slightly worse: `getLastE2EEGroupSharedKey`
-  takes a group MID and a key version but no key id, so it only ever answers with
-  the current key, and the on-disk copy holds one key per group. Messages sealed
-  before a membership change are unreadable once the group has rotated.
-- The chat list costs one `getRecentMessagesV2` per chat, eight at a time, since
-  LINE has no call that returns it directly. Fine for tens of chats, slow for
-  hundreds.
-- TMoreCompact has no decoder here, which is why `/P5` is unusable even though it
-  is what CHRLINE polls.
+Groups do not do this pairwise. The creator generates one key pair for the
+group and gives each member a copy of the private half, wrapped with
+`ECDH(creator, member)` — note **no salt** in that wrapping, unlike message
+keys. Messages then use `ECDH(group_private, sender_public)`, so sending is the
+same derivation with *your own* public key: `senderKeyId` is yours,
+`receiverKeyId` is the group's, and `specVersion` is fixed at 2 rather than
+negotiated (there is no single peer to negotiate with).
+
+`registerE2EEGroupKey` is **not** part of sending, and this client does not
+implement it. It only creates a group key where none has ever existed; any group
+that is already sealed has one, and `getLastE2EEGroupSharedKey` returns it. A
+group that has never been sealed therefore cannot be sealed *by* this client.
+
+Which key id is *yours* depends on direction: for an incoming message you are
+the receiver, but for one you sent, your key is the **sender** key id. Getting
+this wrong makes your own messages undecryptable while everyone else's work.
+
+## Known issues and limits
+
+- **Messages sent by this client may show "This message can't be decrypted" on
+  your other devices.** We sign with the key id lifted from the key chain
+  rather than registering our own via `registerE2EEPublicKey`, so a device that
+  never received that private half cannot read them. Call
+  `line.get_e2ee_public_keys()` to see the account's keys. Not fully diagnosed.
+- **Key rotation is one-way.** `negotiateE2EEPublicKey` returns only a peer's
+  *current* key, so messages predating a rotation stay unreadable. Keys are
+  cached under `.e2eePublicKeys/` to limit future loss; they cannot be recovered
+  retroactively. A message whose key has since rotated fails loudly instead of
+  decrypting to garbage — `get_recent_messages` and `listen` log it and hand
+  back the message with its ciphertext intact.
+- **`getMessageBoxCompactWrapUpListV2`** would build the chat list in one call
+  instead of N, but it is deprecated and neither reference implementation ships
+  its response struct.
+- **Device fingerprint is inconsistent** — a `DESKTOPWIN` application string
+  alongside a Chrome user-agent and `X-Line-Chrome-Version`. Tolerated by the
+  server so far.
+- **Sending encrypted media is unimplemented.** It needs
+  `determineMediaMessageFlow`, a dual upload (object plus `__ud-preview`
+  subresource), and the key material sent as an E2EE dict payload. Receiving
+  sealed media does work.
+- **Large uploads are untested.** The whole file is POSTed in one request;
+  OBS also supports a chunked `range` upload (`bytes 0-N/N`) that this client
+  does not implement. Small files upload fine; a large video may not.
+- **Login is chatty.** The login path prints `[DBG]` diagnostics — including
+  token and key prefixes — straight to stdout. There is no logging switch;
+  redirect stdout if that matters to you.
+
+## Gotchas worth knowing
+
+Things that cost real debugging time here, in case you extend this:
+
+- `unpack_compact` returns a struct result **unwrapped**, but keys a scalar or
+  list result at `0`. Which access is correct depends on the method's declared
+  Thrift return type. Several methods silently returned empty lists because of
+  this.
+- In TCompact, LIST is `0x09` and SET is `0x0A`. They are not the same type.
+- Thrift BINARY fields must be sent as raw `bytes`. Base64-encoding the E2EE
+  login secret makes the phone report "unknown error occurred".
+- `errorCode: "SUCCESS"` is an outcome, not a failure.
+- LINE sends plain text as `ContentType.NONE` (0), with the body in field 10.
+- Sealed media is not stored under `talk/m` and is not addressed by message id.
+  Read `SID`/`OID` out of `contentMetadata` instead — a download that 404s on
+  sealed images but works on plain ones is this.
+
+## Layout
+
+```
+line_chrome/
+  __init__.py   public exports
+  client.py     LINE class: auth, talk, E2EE, media, polling
+  thrift.py     TBinary / TCompact encode + decode, LineServiceError
+  types.py      Chat, ChatSummary, Contact, Message, Operation, Profile, enums
+```
+
+## Credit
+
+Protocol details derived from [CHRLINE](https://github.com/DeachSword/CHRLINE)
 
 ## Disclaimer
 
-Unofficial, built by reverse-engineering. It violates LINE's terms of service and
-can get your account restricted or banned. Use an account you can afford to lose.
-No warranty.
+Unofficial, built by reverse-engineering. It violates LINE's terms of service
+and can get your account restricted or banned. Use an account you can afford to
+lose. No warranty.
