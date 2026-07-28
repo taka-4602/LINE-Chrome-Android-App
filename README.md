@@ -1,4 +1,4 @@
-# LINE-Chrome-Android-App <img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/icon.png" width="7%">
+# LINE-Chrome-Android-App <img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/icon.png" width="8%">
 Chrome Extension LINEのAndroidアプリケーション  
 Chrome ExtensionのLINEをダウンロードたり、[CHRLINE](https://github.com/DeachSword/CHRLINE) を見たり、Sonnet 4.6を使ったりして作った、LLMふつうにすごい  
 すでにビルド済みのアプリは [ここ](https://github.com/taka-4602/LINE-Chrome-Android-App/releases/tag/apk) からどうぞ
@@ -8,8 +8,8 @@ LINE非公式クライアントのAndroidアプリ
 そこそこ昔にサブ端末機能が追加されたので「でもけっきょく2台までしかログイン出来ないのかよ、足りるわけないだろ😡」って人向けになりそう、それか物好き  
 
 ### チャットとフレンド覧
-<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053741_LINE_Chrome.jpg" width="60%"><br>
-<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053455_LINE_Chrome.jpg" width="60%">
+<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053741_LINE_Chrome.jpg" width="70%"><br>
+<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053455_LINE_Chrome.jpg" width="70%">
 
 <br>
 
@@ -18,7 +18,7 @@ LINE非公式クライアントのAndroidアプリ
 
 <br>
 
-<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053420_One_UI_Home.jpg" width="60%">
+<img src="https://raw.githubusercontent.com/taka-4602/LINE-Chrome-Android-App/refs/heads/main/demo_images/Screenshot_20260727_053420_One_UI_Home.jpg" width="70%">
 
 <br>
 
@@ -33,10 +33,10 @@ LINE非公式クライアントのAndroidアプリ
 もちろん不具合やアカウントBANに関しても自己責任でお願いします
 ## その他
 先に必要な機能だけ実装されたPythonライブラリーを作ってそれをもとにAndroidアプリにしてる、例えばオープンチャットの機能は無いなど。 自分が使いたかった機能のみ実装してる自己中クライアント。アプリの言語が英語なのは自分の端末で使ってるフォントが英語しかサポートしてくれないから  
-自分の持っている端末が多過ぎるし、なぜかアカウントBANされたのでLINE自体をもともと使っていなかったけど、インターンシップ先の企業がLINEでコミュニケーションを取っていたため使わないといけなかった  
-今まではKiwi BrowserにChrome ExtensionのLINEをインストールしてかなり無理やり使っていたけど、さすがに不便過ぎていい方法を模索してたけど無かったので仕方ないね  
+持っている端末が多過ぎるし、なぜかアカウントBANされていてLINE自体をもともと使っていなかったけど、インターンシップ先の企業がLINEでコミュニケーションを取っていたため使わないといけなかった  
+今まではKiwi BrowserにChrome ExtensionのLINEをインストールしてかなり無理やり使ってて、さすがに不便過ぎていい方法を模索してたけど無かったので仕方ないね  
 友達が「オープンソースにしておけば誰かがアップグレードしてくれるかもよ！」と言ってたのでGitHubへアップロードすることに。 動機がゲスい  
-E2EEやログインフローも先人様たちのおかげですぐ攻略出来たので、ここに感謝申し上げます
+E2EEやログインフローなど先人様たちのおかげですぐ攻略出来たので、ここに感謝申し上げます
 ## コンタクト  
 Discord サーバー / https://discord.gg/2vSnNuRmQ6  
 Discord ユーザー名 / zkcn  
