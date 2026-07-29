@@ -95,17 +95,42 @@ There is no way to ask LINE where the poll lives, and it has moved. So
 
 | Endpoint | Method | Result on a live DESKTOPWIN account |
 |---|---|---|
-| `/P3` | `fetchOperations` | **works** — what this client uses |
-| `/P4` | `fetchOperations` | rejected |
-| `/P5` | `fetchOps` | what CHRLINE uses; replies in TMoreCompact, no decoder here |
-| `/P4` | `fetchOps` | what the Python client uses; `invalid method name: "fetchOps"` |
+| `/P4` | `sync` | **works** — what this client uses |
+| `/SYNC4` | `sync` | works too |
+| `/S4` | `sync` | works too |
+| `/P3` | `fetchOperations` | HTTP 200 with a **zero-byte body**, to any method |
+| `/P4` | `fetchOperations` | `Invalid method name: 'fetchOperations'` |
+| `/P5` | `fetchOps` | `Invalid method name: 'fetchOps'`, in TMoreCompact |
+| `/P4` | `fetchOps` | what the Python client uses; `Invalid method name: 'fetchOps'` |
 
-That last row is why the Python client's `listen()` never worked: `/P4` speaks
-TCompact perfectly well, it just does not host that method, and the error was
-being swallowed by the decoder.
+`sync` takes its arguments **wrapped in a request struct at field 1**, not
+spread across the top level the way `fetchOps` does; sent flat it answers
+`request is null`. It replies with a struct rather than a bare list —
+operations at field 1, a has-more flag at 2, a per-op-type delivery policy at
+3 — and the decoder keys that at **1**, where `fetchOps` is keyed at 0.
+`operationsIn` reads both.
 
-Probing rather than hard-coding `/P3` costs a few seconds once per session and
-buys a diagnosis instead of a silent failure if LINE moves things again. The
+### How `/P3` cost this client its op stream
+
+`/P3` answers every request, with any method name, as HTTP 200 and an empty
+body. The probe used to accept a candidate that merely failed to throw, so
+`/P3` won this list on position and was never revisited — and an empty body,
+by the time it had been flattened to a list, was indistinguishable from a quiet
+account. The connection reported itself `Live` and delivered **nothing** for
+the life of the session, while messages kept appearing via the open-chat
+refresh and the fallback sweep, which is what hid it.
+
+So a candidate now has to *answer*, not merely fail to throw: `postPoll` takes
+a `strict` flag that rejects an empty body, and only the probe passes it. A
+working route always has something to say — `sync` returns its policy map even
+with no operations pending.
+
+The `fetch*` names are kept behind `sync` rather than deleted. They cost one
+bounded request each only when `sync` has already failed, and only this account
+has been tested.
+
+Probing rather than hard-coding costs a few seconds once per session and buys a
+diagnosis instead of a silent failure if LINE moves things again. The
 per-candidate rejections are kept in `pollDiagnostics` and surfaced under
 **Settings → Connection** behind a Copy button — they name the endpoint and
 method the server rejected, which is the only thing that identifies the right
@@ -122,12 +147,40 @@ to throw: defaulting to revision 0 is not graceful degradation, it asks the
 server for every operation the account has ever seen, and the poll then times
 out forever.
 
+## Answering is not delivering
+
+A route that replies is not the same as a route that works, and for a long time
+nothing in this loop could tell the difference. `/P3` answered every request
+with an empty body, won the probe on that basis, was promoted to short-polling
+by the instant-empty heuristic, and then delivered **nothing at all** while the
+connection reported itself `Live`. Messages kept arriving over the open-chat
+refresh and the fallback sweep, so it looked fine from the outside.
+
+`healthCheck` closes that. On an empty round — and only on an empty round, so a
+poll that is delivering never pays for it — it asks `getLastOpRevision` where
+the server thinks the stream is. If the server has moved past what this client
+has consumed, the operations exist and the poll is not producing them, which is
+`PollNotDelivering` and drops to the fallback so the route gets re-probed.
+
+The two cadences are deliberately far apart:
+
+| Route | Checked every | Why |
+|---|---|---|
+| never delivered | 60s | it might be `/P3` again, and has everything to prove |
+| has delivered | 10 min | almost certainly fine; this is a sanity test, and a quiet account should not pay sixty requests an hour for it |
+
+`pollProven` — set when a batch arrives, cleared with the route — is what picks
+between them. It had been written and never read.
+
+What this cannot catch is a route that delivers *some* operations and silently
+drops others; the revision would keep up and nothing would look wrong.
+
 ## The twist: the working route is not a long-poll
 
-`/P3 fetchOperations` answers **immediately** with an empty list when nothing has
-happened. After all the long-poll plumbing, the one endpoint that works behaves
-as a short-poll. That is fine — it delivers — it is simply not what the code was
-built for, and it has to be *detected* rather than assumed.
+`/P4 sync` answers **immediately** when nothing has happened, rather than
+holding the request open. After all the long-poll plumbing, the endpoint that
+works behaves as a short-poll. That is fine — it delivers — it is simply not
+what the code was built for, and it has to be *detected* rather than assumed.
 
 The reason it cannot be assumed: **a genuine long-poll also returns instantly
 when there is a backlog waiting.** A fast return proves nothing on its own.
@@ -340,19 +393,25 @@ output behind a Copy button when degraded.
 adb logcat -s PollingService:* LineClient:*
 ```
 
+On Samsung, `Log.d` never reaches logcat from a third-party app — only `I` and
+above get through. That is worth knowing before concluding a code path is not
+running: the `unhandled op` line in `applyOps` is a `Log.d` and is invisible on
+those devices even when it fires. `adb shell setprop log.tag.LineClient VERBOSE`
+does not lift it.
+
 What to expect in a healthy session:
 
 ```
-LineClient     poll route resolved: /P3 fetchOperations (0 ops)
+LineClient     poll route resolved: /P4 sync (0 ops)
 LineClient     starting from revision 1234567890
-PollingService /P3 fetchOperations answers immediately; short-polling
+PollingService /P4 sync answers immediately; short-polling
 ```
 
 And when it is not healthy:
 
 ```
-LineClient     poll candidate /P3 fetchOperations rejected: ...
-PollingService long-poll unavailable: /P3 fetchOperations -> ... | /P4 ...
+LineClient     poll candidate /P4 sync rejected: ...
+PollingService long-poll unavailable: /P4 sync -> ... | /SYNC4 ...
 PollingService fallback refresh failed: ...
 ```
 
