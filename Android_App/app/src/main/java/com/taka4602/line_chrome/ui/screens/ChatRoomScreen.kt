@@ -122,6 +122,9 @@ fun ChatRoomScreen(
     val copyMessage: (String) -> Unit = { text ->
         if (copyToClipboard(context, "Message", text)) onStatus("Copied")
     }
+    val copyStickerUrl: (String) -> Unit = { url ->
+        if (copyToClipboard(context, "Sticker URL", url)) onStatus("Copied sticker URL")
+    }
     // Cleared when the chat changes: a reply drafted in one conversation
     // has no meaning in another.
     var replyingTo by remember(target.mid) { mutableStateOf<Message?>(null) }
@@ -256,6 +259,7 @@ fun ChatRoomScreen(
                     onRetryMedia = onRetryMedia,
                     onOpenMedia = onOpenMedia,
                     onCopy = copyMessage,
+                    onCopyStickerUrl = copyStickerUrl,
                     onShare = { shareText(context, it) },
                     onReply = { replyingTo = it },
                     originalOf = { id -> byId[id] },
@@ -356,6 +360,7 @@ private fun MessageBubble(
     onRetryMedia: (Message) -> Unit,
     onOpenMedia: (Message) -> Unit,
     onCopy: (String) -> Unit,
+    onCopyStickerUrl: (String) -> Unit,
     onShare: (String) -> Unit,
     onReply: (Message) -> Unit,
     originalOf: (String) -> Message?,
@@ -485,6 +490,12 @@ private fun MessageBubble(
                             text = { Text("Reply") },
                             onClick = { menuOpen = false; onReply(message) },
                         )
+                        if (sticker != null) {
+                            DropdownMenuItem(
+                                text = { Text("Copy sticker URL") },
+                                onClick = { menuOpen = false; onCopyStickerUrl(sticker) },
+                            )
+                        }
                         if (body != null) {
                             DropdownMenuItem(
                                 text = { Text("Copy") },
