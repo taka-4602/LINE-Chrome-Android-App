@@ -1095,6 +1095,26 @@ class LineClient(
     /** The route in use, once one has been resolved. */
     val activePollRoute: PollRoute? get() = pollRoute
 
+    /**
+     * Whether the current route has ever actually handed back an operation.
+     *
+     * Answering is not delivering.  `/P3` replies 200 with an empty body to
+     * anything and used to win the probe on that basis, then deliver nothing
+     * for the life of the session while the connection reported itself Live —
+     * so a route that has yet to prove itself is watched more closely.  Reset
+     * with the route by [resetPollRoute].
+     */
+    val pollDelivered: Boolean get() = pollProven
+
+    /**
+     * How far this client believes it has consumed the operation stream.
+     *
+     * Compared against [getLastOpRevision] to tell a quiet account from a route
+     * that is not delivering: the server's revision moving while this one stays
+     * put means operations exist that the poll is not handing over.
+     */
+    val localRevision: Long get() = revision
+
     /** Forget the resolved route so the next poll probes again. */
     fun resetPollRoute() {
         pollRoute = null

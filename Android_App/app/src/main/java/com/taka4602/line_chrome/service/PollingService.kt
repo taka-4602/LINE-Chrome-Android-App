@@ -192,6 +192,9 @@ class PollingService : Service() {
         withContext(Dispatchers.IO) { client.seedRevision() }
         var instantEmpties = 0
         var shortPolling = false
+        // Seeding has just made the two revisions equal, so there is nothing to
+        // compare yet; start the clock rather than the check.
+        var lastHealthCheck = System.currentTimeMillis()
         publishLive(client, shortPolling = false)
 
         while (scope.isActive) {
@@ -200,8 +203,13 @@ class PollingService : Service() {
             scope.ensureActive()
             val elapsed = System.currentTimeMillis() - startedAt
 
+            if (ops.isEmpty()) lastHealthCheck = healthCheck(client, lastHealthCheck)
+
             if (ops.isNotEmpty()) {
                 instantEmpties = 0
+                // The cursor is what [healthCheck] judges the route by, so it is
+                // worth being able to see it move.
+                Log.i(TAG, "poll delivered ${ops.size} ops; revision now ${client.localRevision}")
                 notify(LineRepository.applyOps(ops))
             } else if (elapsed < INSTANT_MS) {
                 // Not every poll endpoint holds the request open.  /P3
@@ -229,6 +237,48 @@ class PollingService : Service() {
             val remaining = pace - elapsed
             if (remaining > 0) delay(remaining)
         }
+    }
+
+    /**
+     * Is an empty poll a quiet account, or a route that does not deliver?
+     *
+     * Nothing else in this loop can tell those apart, which is how a route that
+     * answered every request with an empty body held a connection reported as
+     * **Live** and handed over not one operation.  The server's own revision
+     * settles it: if it has moved past what this client has consumed, the
+     * operations exist and the poll is simply not producing them.
+     *
+     * Costs one TalkService call, and only ever on an empty round — a poll that
+     * is delivering never reaches here.  A route that has never yet delivered
+     * is checked far sooner than one that has, since it is the one with
+     * something to prove.
+     *
+     * @return when to next allow a check.
+     */
+    private suspend fun healthCheck(client: LineClient, lastCheck: Long): Long {
+        val due = if (client.pollDelivered) HEALTH_PROVEN_MS else HEALTH_UNPROVEN_MS
+        val now = System.currentTimeMillis()
+        if (now - lastCheck < due) return lastCheck
+
+        val server = try {
+            withContext(Dispatchers.IO) { client.getLastOpRevision() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // The check is not worth failing the session over; a poll that is
+            // genuinely broken will still be here at the next one.  Warn rather
+            // than debug: a check that never runs is a check that proves
+            // nothing, and Log.d does not reach logcat on every device.
+            Log.w(TAG, "health check failed: ${e.message}")
+            return now
+        }
+
+        val local = client.localRevision
+        if (server > local) {
+            throw PollNotDelivering(client.activePollRoute?.toString(), local, server)
+        }
+        Log.i(TAG, "poll healthy: revision $local, server $server")
+        return now
     }
 
     /** The route only resolves on the first poll, so this is published late. */
@@ -294,6 +344,10 @@ class PollingService : Service() {
     private class ShortPollDisabled(route: String?) :
         Exception("$route answers immediately and short-polling is off")
 
+    /** The route answers, but the operations it should be carrying are not arriving. */
+    private class PollNotDelivering(route: String?, local: Long, server: Long) :
+        Exception("$route answers but delivers nothing — at revision $local, server is at $server")
+
     private fun notify(messages: List<Pair<ChatSummary, Message>>) {
         if (messages.isEmpty() || !LineRepository.sessionStore.notificationsEnabled) return
         for ((chat, msg) in messages) {
@@ -336,6 +390,19 @@ class PollingService : Service() {
 
         /** Consecutive instant empty answers before treating this as a short-poll. */
         private const val SHORT_POLL_AFTER = 3
+
+        /**
+         * How long a run of empty polls may go unquestioned.
+         *
+         * Two figures because the risks are not symmetric.  A route that has
+         * never delivered might be `/P3` all over again — answering everything,
+         * carrying nothing — so it is asked to account for itself within the
+         * minute.  One that has delivered is almost certainly fine and the check
+         * is a rare sanity test, paced so a genuinely quiet account costs six
+         * extra requests an hour rather than sixty.
+         */
+        private const val HEALTH_UNPROVEN_MS = 60_000L
+        private const val HEALTH_PROVEN_MS = 10 * 60_000L
 
         /** How often a switched-off loop looks to see whether it is back on. */
         private const val IDLE_TICK_MS = 2_000L
