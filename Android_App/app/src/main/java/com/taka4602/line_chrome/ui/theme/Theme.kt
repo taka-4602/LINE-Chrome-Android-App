@@ -1,10 +1,12 @@
 package com.taka4602.line_chrome.ui.theme
 
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.unit.dp
 
 /**
@@ -69,6 +71,20 @@ fun LineChromeTheme(content: @Composable () -> Unit) {
         colorScheme = DarkColorScheme,
         shapes = ExpressiveShapes,
         typography = Typography,
-        content = content,
-    )
+    ) {
+        // Text that names no colour of its own takes LocalContentColor, and
+        // material3 defaults that to **black** — it expects a Surface to have
+        // provided something, and a bare MaterialTheme never does.  Most text
+        // here escapes it by sitting inside a Scaffold or an app bar, which
+        // provide their own; anything that does not was drawing black on a
+        // background that is nearly black, at about 1.1:1.
+        //
+        // Provided here rather than by wrapping the app in a Surface, because a
+        // Surface would also add a background draw and another pointer-input
+        // participant under everything, and the defect is only the colour.
+        CompositionLocalProvider(
+            LocalContentColor provides DarkColorScheme.onBackground,
+            content = content,
+        )
+    }
 }

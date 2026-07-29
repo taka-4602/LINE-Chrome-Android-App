@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -122,6 +123,21 @@ object LineRepository {
     /** chatMid -> messages, oldest first. */
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     val messages: StateFlow<Map<String, List<Message>>> = _messages.asStateFlow()
+
+    /**
+     * chatMid -> (readerMid -> the newest message id that reader has read).
+     *
+     * One entry per reader rather than per message, because a read receipt is
+     * cumulative: it says "I have read up to here", which settles every earlier
+     * message at the same time.  Held apart from [_messages] because it arrives
+     * long after the message is stored and, in a group, keeps changing as more
+     * people catch up.
+     *
+     * Not persisted, but not lost either: [loadReadReceipts] refills it from
+     * the server when a chat is opened, so a restart costs nothing visible.
+     */
+    private val _readReceipts = MutableStateFlow<Map<String, Map<String, String>>>(emptyMap())
+    val readReceipts: StateFlow<Map<String, Map<String, String>>> = _readReceipts.asStateFlow()
 
     private val _syncing = MutableStateFlow(false)
     val syncing: StateFlow<Boolean> = _syncing.asStateFlow()
@@ -817,6 +833,9 @@ object LineRepository {
 
     fun loadMessages(chatMid: String, count: Int = 50) {
         val c = client ?: return
+        // Independent of the messages themselves, so it is not held up by them
+        // and does not hold them up: the read label appears a moment after the bubbles do.
+        loadReadReceipts(chatMid)
         scope.launch {
             _loadingMessages.value = true
             try {
@@ -1342,7 +1361,11 @@ object LineRepository {
                     }
                 }
 
-                OpType.NOTIFIED_READ_MESSAGE, OpType.SEND_CHAT_CHECKED -> Unit
+                OpType.NOTIFIED_READ_MESSAGE -> recordRead(op)
+
+                // Our own receipt, echoed back.  Nobody is told we read our
+                // own chat, so there is nothing to show for it.
+                OpType.SEND_CHAT_CHECKED -> Unit
 
                 else -> Log.d(TAG, "unhandled op ${op.opType}")
             }
@@ -1352,6 +1375,90 @@ object LineRepository {
     }
 
     // -- helpers -----------------------------------------------------------
+
+    /**
+     * Someone read a chat we are in — the op behind the read label.
+     *
+     * The three params are `chatMid`, the reader, and the message they read up
+     * to.  Observed in a 1:1, where the first two are both the other party:
+     *
+     *     p1=u9ac1f48…  p2=u9ac1f48…  p3=624950626019180681
+     *
+     * That last one is the least dependable: LINE has shipped it as a message
+     * id, as empty, and as something that is not an id at all, depending on the
+     * client version the receipt came from.  Only a decimal id is usable,
+     * because [readCounts] positions readers by comparing ids numerically;
+     * anything else is treated as "read everything we currently hold" and
+     * pinned to the newest message in the chat, which is what the receipt means
+     * in practice anyway.
+     */
+    private fun recordRead(op: Operation) {
+        val c = client ?: return
+        val reader = op.param2 ?: return
+        // Our own other devices reading do not put a read label on our messages.
+        if (reader == c.mid) return
+        // A 1:1 receipt names the chat from the reader's side, so it can arrive
+        // addressed to us; the chat is then the other party.  Same shape as the
+        // message case above.
+        val chatMid = op.param1?.takeIf { it != c.mid } ?: reader
+
+        val reported = op.param3?.takeIf { it.toLongOrNull() != null }
+        val mark = reported ?: (_messages.value[chatMid]?.lastOrNull()?.id ?: return)
+        if (reported == null) {
+            Log.d(TAG, "read receipt for $chatMid carried param3=${op.param3}, using $mark")
+        }
+
+        mergeReadMarks(chatMid, mapOf(reader to mark))
+    }
+
+    /**
+     * Fold read marks into [_readReceipts], keeping whichever is furthest on.
+     *
+     * Marks reach us from two directions — the live `NOTIFIED_READ_MESSAGE`
+     * operations and the [LineClient.getMessageReadRange] backfill — and the
+     * two overlap and race.  A mark that moves backwards would un-read messages
+     * already shown as read, so the newest always wins regardless of which
+     * source it came from or which order they arrive in.
+     */
+    private fun mergeReadMarks(chatMid: String, marks: Map<String, String>) {
+        val self = client?.mid
+        // Our own reading is not a read label on our own messages.
+        val incoming = marks.filterKeys { it != self }
+        if (incoming.isEmpty()) return
+        _readReceipts.update { all ->
+            val forChat = all[chatMid].orEmpty()
+            val merged = forChat.toMutableMap()
+            for ((reader, mark) in incoming) {
+                val current = merged[reader]?.toLongOrNull()
+                val next = mark.toLongOrNull()
+                if (current != null && next != null && current >= next) continue
+                merged[reader] = mark
+            }
+            if (merged == forChat) all else all + (chatMid to merged)
+        }
+    }
+
+    /**
+     * Ask LINE how far everyone has read in [chatMid].
+     *
+     * Operations only report reads that happen while the poll is running, so on
+     * their own every read mark vanishes when the app restarts and does not come back
+     * until somebody reads something new.  This is what makes opening a chat
+     * show the read state it already has.
+     */
+    fun loadReadReceipts(chatMid: String) {
+        val c = client ?: return
+        scope.launch {
+            try {
+                val ranges = withContext(Dispatchers.IO) { c.getMessageReadRange(listOf(chatMid)) }
+                ranges.forEach { (mid, marks) -> mergeReadMarks(mid, marks) }
+            } catch (e: Exception) {
+                // Nothing to surface: the chat is readable either way, it just
+                // shows no read label until an operation supplies one.
+                Log.w(TAG, "read range for $chatMid failed", e)
+            }
+        }
+    }
 
     private suspend fun <T> coroutineScopeIO(block: suspend CoroutineScope.() -> T): T =
         withContext(Dispatchers.IO) { kotlinx.coroutines.coroutineScope(block) }

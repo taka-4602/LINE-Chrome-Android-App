@@ -61,7 +61,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -79,6 +81,8 @@ import com.taka4602.line_chrome.ui.components.shareText
 import com.taka4602.line_chrome.ui.components.crossesDay
 import com.taka4602.line_chrome.ui.components.formatClock
 import com.taka4602.line_chrome.ui.components.formatDayLabel
+import com.taka4602.line_chrome.ui.components.LinkableText
+import com.taka4602.line_chrome.ui.theme.LinkBlue
 
 data class ChatTarget(
     val mid: String,
@@ -92,6 +96,8 @@ data class ChatTarget(
 fun ChatRoomScreen(
     target: ChatTarget,
     messages: List<Message>,
+    /** readerMid -> the newest message id that reader has read, for this chat. */
+    receipts: Map<String, String>,
     selfMid: String,
     nameOf: (String?) -> String,
     pictureOf: (String?) -> String?,
@@ -120,6 +126,9 @@ fun ChatRoomScreen(
     // has no meaning in another.
     var replyingTo by remember(target.mid) { mutableStateOf<Message?>(null) }
     val byId = remember(messages) { messages.associateBy { it.id } }
+    val readCounts = remember(messages, receipts, selfMid) {
+        readCounts(messages, receipts, selfMid)
+    }
     // Opening a chat should land at the newest message outright; only later
     // arrivals are worth animating to.
     var landed by remember(target.mid) { mutableStateOf(false) }
@@ -223,6 +232,7 @@ fun ChatRoomScreen(
         ) {
             itemsIndexedStable(messages) { index, msg ->
                 val previous = messages.getOrNull(index - 1)
+                val readBy = readCounts[msg.id] ?: 0
                 if (crossesDay(previous?.createdTime, msg.createdTime)) {
                     DaySeparator(formatDayLabel(msg.createdTime))
                 }
@@ -234,6 +244,8 @@ fun ChatRoomScreen(
                 MessageBubble(
                     message = msg,
                     mine = mine,
+                    readBy = readBy,
+                    isGroup = target.isGroup,
                     senderName = if (showSender) nameOf(msg.sender) else null,
                     senderPicture = pictureOf(msg.sender),
                     showAvatar = target.isGroup && !mine,
@@ -276,6 +288,40 @@ private inline fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedSt
     content(index, messages[index])
 }
 
+/**
+ * How many people have read each of my messages, keyed by message id.
+ *
+ * A receipt is cumulative — "read up to here" — so one reader counts for every
+ * message of mine at or before their mark.  The comparison is numeric on the
+ * message id rather than positional in [messages], because a mark often falls
+ * outside the loaded window: someone who is further ahead than anything on
+ * screen still counts for all of it, and someone still behind the top of the
+ * window counts for none.  An id that is not a number cannot be placed either
+ * way and is left out, which shows no label rather than a wrong one.
+ *
+ * Only my own messages get an entry; nobody is told who read theirs.
+ */
+internal fun readCounts(
+    messages: List<Message>,
+    receipts: Map<String, String>,
+    selfMid: String,
+): Map<String, Int> {
+    if (receipts.isEmpty()) return emptyMap()
+    val marks = receipts.values.mapNotNull { it.toLongOrNull() }
+    if (marks.isEmpty()) return emptyMap()
+
+    val counts = HashMap<String, Int>()
+    for (message in messages) {
+        if (message.sender != selfMid) continue
+        val id = message.id ?: continue
+        val position = id.toLongOrNull() ?: continue
+        // Group membership bounds this, so it stays a handful of comparisons.
+        val readers = marks.count { it >= position }
+        if (readers > 0) counts[id] = readers
+    }
+    return counts
+}
+
 @Composable
 private fun DaySeparator(label: String) {
     Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
@@ -298,6 +344,8 @@ private fun DaySeparator(label: String) {
 private fun MessageBubble(
     message: Message,
     mine: Boolean,
+    readBy: Int,
+    isGroup: Boolean,
     senderName: String?,
     senderPicture: String?,
     showAvatar: Boolean,
@@ -348,7 +396,12 @@ private fun MessageBubble(
 
             Row(verticalAlignment = Alignment.Bottom) {
                 if (mine) {
-                    TimeLabel(message.createdTime)
+                    // The read label sits above the clock, both hugging the bubble, which
+                    // is where LINE itself puts them.
+                    Column(horizontalAlignment = Alignment.End) {
+                        if (readBy > 0) ReadLabel(readBy, isGroup)
+                        TimeLabel(message.createdTime)
+                    }
                     Spacer(Modifier.width(6.dp))
                 }
 
@@ -393,6 +446,8 @@ private fun MessageBubble(
                             color = if (mine) MaterialTheme.colorScheme.primaryContainer
                             else MaterialTheme.colorScheme.surfaceContainerHigh,
                             shape = bubbleShape(mine),
+                            // Still here for the bubble's padding, which the
+                            // text's own handler does not cover.
                             modifier = Modifier
                                 .widthIn(max = 280.dp)
                                 .combinedClickable(
@@ -409,11 +464,14 @@ private fun MessageBubble(
                                         mine = mine,
                                     )
                                 }
-                                Text(
+                                LinkableText(
                                     text = message.preview,
                                     style = MaterialTheme.typography.bodyLarge,
                                     color = if (mine) MaterialTheme.colorScheme.onPrimaryContainer
                                     else MaterialTheme.colorScheme.onSurface,
+                                    linkStyle = LINK_STYLE,
+                                    onDoubleTap = { onReply(message) },
+                                    onLongPress = { menuOpen = true },
                                 )
                             }
                         }
@@ -493,6 +551,18 @@ private fun QuotedMessage(original: Message?, nameOf: (String?) -> String, mine:
     }
 }
 
+/**
+ * Links, on both bubble colours.
+ *
+ * Underlined as well as blue, because colour alone is not something everyone
+ * can see, and a link that only differs by hue is invisible to a good number of
+ * readers.
+ */
+private val LINK_STYLE = SpanStyle(
+    color = LinkBlue,
+    textDecoration = TextDecoration.Underline,
+)
+
 /** The tail corner points at the sender, the rest stay generously rounded. */
 private fun bubbleShape(mine: Boolean) = RoundedCornerShape(
     topStart = 20.dp,
@@ -500,6 +570,22 @@ private fun bubbleShape(mine: Boolean) = RoundedCornerShape(
     bottomStart = if (mine) 20.dp else 6.dp,
     bottomEnd = if (mine) 6.dp else 20.dp,
 )
+
+/**
+ * "Read" in a 1:1 chat, "Read N" in a group — LINE's 既読 and 既読N.
+ *
+ * A group counts readers because the number is the information — one person of
+ * twenty having read is not the same as twenty.  A 1:1 has only one possible
+ * reader, so the count would always be 1 and only adds noise.
+ */
+@Composable
+private fun ReadLabel(count: Int, isGroup: Boolean) {
+    Text(
+        text = if (isGroup) "Read $count" else "Read",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
 
 @Composable
 private fun TimeLabel(ms: Long?) {

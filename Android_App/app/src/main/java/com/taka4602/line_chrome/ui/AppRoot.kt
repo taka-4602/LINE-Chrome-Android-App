@@ -55,6 +55,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.background
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
@@ -218,6 +220,7 @@ private fun SignedIn(
     val contacts by LineRepository.contacts.collectAsState()
     val groups by LineRepository.groups.collectAsState()
     val messages by LineRepository.messages.collectAsState()
+    val readReceipts by LineRepository.readReceipts.collectAsState()
     val syncing by LineRepository.syncing.collectAsState()
     val status by LineRepository.status.collectAsState()
     val connection by LineRepository.connection.collectAsState()
@@ -361,6 +364,7 @@ private fun SignedIn(
             ChatRoomScreen(
                 target = chatTargetOf(mid),
                 messages = messages[mid].orEmpty(),
+                receipts = readReceipts[mid].orEmpty(),
                 selfMid = profile.mid,
                 nameOf = LineRepository::nameOf,
                 pictureOf = LineRepository::pictureOf,
@@ -495,13 +499,19 @@ private fun SignedIn(
         // Captured here because Row's scope shadows BoxWithConstraintsScope.
         val windowWidth = maxWidth
 
-        if (windowWidth >= TWO_PANE_MIN_WIDTH) {
-            // Both panes are already on screen, so there is no reveal to preview
-            // and back is a plain state change.
-            BackHandler(enabled = pane != null) {
-                if (openProfile != null) openProfile = null else openChatMid = null
-            }
+        // Where back lands: out of a profile opened from a conversation is that
+        // conversation, and out of anything else is the list — or, side by side,
+        // the empty state standing in for it.
+        val under: Pane? =
+            if (pane is Pane.Profile) openChatMid?.let(Pane::Chat) else null
 
+        // `pane is Pane.Profile` is the same test as `openProfile != null`,
+        // since that is what pane is derived from.
+        val closePane = {
+            if (pane is Pane.Profile) openProfile = null else openChatMid = null
+        }
+
+        if (windowWidth >= TWO_PANE_MIN_WIDTH) {
             Row(Modifier.fillMaxSize()) {
                 listPane(
                     Modifier.width(
@@ -509,126 +519,163 @@ private fun SignedIn(
                     )
                 )
                 VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                Box(Modifier.weight(1f)) {
-                    detailPane(pane, true)
+                // The list is not going anywhere, so the swipe is scoped to the
+                // detail pane: the conversation slides off toward the right edge
+                // and the empty state — or the conversation a profile was opened
+                // from — comes up underneath it.  Same motion as the stacked
+                // layout, played out in a narrower box.
+                // Clipped, because a sliding pane is *translated* rather than
+                // resized and will happily draw outside the box it belongs to.
+                // Stacked that spill goes off-screen and nobody sees it; here
+                // it lands on the list, which is how the covered pane's dim
+                // ended up as a dark band sitting over the conversation list.
+                Box(Modifier.weight(1f).clipToBounds()) {
+                    SeekablePanes(pane, under, closePane) { shown ->
+                        detailPane(shown, true)
+                    }
                 }
             }
         } else {
-            // Seekable rather than fire-and-forget: the same transition a tap
-            // plays through is the one a back gesture scrubs by hand, so letting
-            // go part-way can rewind it instead of having to jump.
-            // Seeded with whatever is already open rather than with the list,
-            // so this settles where it starts.  Closing the viewer recomposes
-            // this branch from scratch (it early-returns above, disposing the
-            // whole thing), and from a null seed that arrives as a conversation
-            // sliding in over a list nobody navigated to.  Same for a restore
-            // after process death, where the open mid outlives the state here.
-            val paneState = remember { SeekableTransitionState(pane) }
-
-            LaunchedEffect(pane) {
-                if (paneState.targetState != pane) paneState.animateTo(pane, PANE_MOTION)
+            SeekablePanes(pane, under, closePane) { shown ->
+                if (shown != null) detailPane(shown, false) else listPane(Modifier)
             }
+        }
+    }
+}
 
-            // Where back lands: out of a profile opened from a conversation is
-            // that conversation, and out of anything else is the list.
-            val under: Pane? =
-                if (pane is Pane.Profile) openChatMid?.let(Pane::Chat) else null
+/**
+ * The pane stack, with a back gesture that can be scrubbed by hand.
+ *
+ * Seekable rather than fire-and-forget: the same transition a tap plays through
+ * is the one a back gesture drives, so letting go part-way rewinds it instead of
+ * having to jump.
+ *
+ * Used by both layouts.  Stacked, [content] draws the whole window and the pane
+ * underneath is the list.  Side by side it draws only the detail pane, the list
+ * sits beside it untouched, and the thing underneath is the empty state — the
+ * surface leaving the screen is smaller, but it is the same surface leaving in
+ * the same direction, so back feels identical whichever way the device is open.
+ *
+ * @param under where a committed gesture lands, which is not always null: a
+ *   profile opened from a conversation goes back to that conversation.
+ * @param onCommitted clears the selection, once the animation has arrived.
+ */
+@Composable
+private fun SeekablePanes(
+    pane: Pane?,
+    under: Pane?,
+    onCommitted: () -> Unit,
+    content: @Composable (Pane?) -> Unit,
+) {
+    // Seeded with whatever is already open rather than with the list, so this
+    // settles where it starts.  Closing the media viewer recomposes the caller
+    // from scratch (it early-returns, disposing the whole thing), and from a
+    // null seed that arrives as a conversation sliding in over a list nobody
+    // navigated to.  Same for a restore after process death, where the open mid
+    // outlives the state here.
+    val paneState = remember { SeekableTransitionState(pane) }
 
-            // Every animation a gesture leaves behind runs here rather than in
-            // the gesture's own coroutine.  PredictiveBackHandler cancels that
-            // coroutine outright — its cleanup does `channel.cancel()` *and*
-            // `job.cancel()` — both when the swipe is abandoned and when a
-            // second swipe starts on top of the first.  A suspending animateTo
-            // in a cancelled job throws at its first suspension point and never
-            // draws a frame, which is what leaves a pane stranded half way
-            // across the screen with nothing left running to finish it.
-            val paneScope = rememberCoroutineScope()
+    LaunchedEffect(pane) {
+        if (paneState.targetState != pane) paneState.animateTo(pane, PANE_MOTION)
+    }
 
-            PredictiveBackHandler(enabled = pane != null) { progress ->
-                try {
-                    progress.collect {
-                        paneState.seekTo(PredictiveBackEasing.transform(it.progress), under)
-                    }
-                    // Committed.  The animation is finished off the state it is
-                    // already seeking to, and only then is the selection cleared
-                    // — clearing first would restart this composable's effect
-                    // against a transition that has already arrived, which reads
-                    // as "no work to do" and leaves the pane frozen mid-swipe.
-                    // Both halves go to paneScope together so that a swipe
-                    // interrupting this one cannot land between them and strand
-                    // the selection open under a finished animation.
-                    paneScope.launch {
-                        paneState.animateTo(under, PANE_SETTLE)
-                        if (pane is Pane.Profile) openProfile = null else openChatMid = null
-                    }
-                } catch (cancelled: CancellationException) {
-                    // Abandoned, so wind back to where it began.  Nothing to
-                    // rethrow: this coroutine is already cancelled, which is
-                    // exactly why the rewind is handed to paneScope.
-                    paneScope.launch {
-                        paneState.animateTo(paneState.currentState, PANE_SETTLE)
-                    }
-                }
+    // Every animation a gesture leaves behind runs here rather than in the
+    // gesture's own coroutine.  PredictiveBackHandler cancels that coroutine
+    // outright — its cleanup does `channel.cancel()` *and* `job.cancel()` —
+    // both when the swipe is abandoned and when a second swipe starts on top of
+    // the first.  A suspending animateTo in a cancelled job throws at its first
+    // suspension point and never draws a frame, which is what leaves a pane
+    // stranded half way across the screen with nothing left running to finish
+    // it.
+    val paneScope = rememberCoroutineScope()
+
+    PredictiveBackHandler(enabled = pane != null) { progress ->
+        try {
+            progress.collect {
+                paneState.seekTo(PredictiveBackEasing.transform(it.progress), under)
             }
+            // Committed.  The animation is finished off the state it is already
+            // seeking to, and only then is the selection cleared — clearing
+            // first would restart the effect above against a transition that
+            // has already arrived, which reads as "no work to do" and leaves
+            // the pane frozen mid-swipe.  Both halves go to paneScope together
+            // so that a swipe interrupting this one cannot land between them
+            // and strand the selection open under a finished animation.
+            paneScope.launch {
+                paneState.animateTo(under, PANE_SETTLE)
+                onCommitted()
+            }
+        } catch (cancelled: CancellationException) {
+            // Abandoned, so wind back to where it began.  Nothing to rethrow:
+            // this coroutine is already cancelled, which is exactly why the
+            // rewind is handed to paneScope.
+            paneScope.launch {
+                paneState.animateTo(paneState.currentState, PANE_SETTLE)
+            }
+        }
+    }
 
-            rememberTransition(paneState, label = "pane").AnimatedContent(
-                transitionSpec = {
-                    // Going deeper slides the new pane over what was there;
-                    // coming back slides it off and eases the pane underneath
-                    // in from a slight parallax, so the two directions do not
-                    // look like the same push twice.
-                    val deeper = targetState.depth() > initialState.depth()
-                    ContentTransform(
-                        targetContentEnter = slideInHorizontally(paneSpec()) {
-                            if (deeper) it else -it / PANE_PARALLAX
-                        },
-                        initialContentExit = slideOutHorizontally(paneSpec()) {
-                            if (deeper) -it / PANE_PARALLAX else it
-                        },
-                        // Depth alone decides what draws on top, which holds in
-                        // both directions because each pane keeps the z-index it
-                        // entered under.  Left at the default every pane sits at
-                        // zero and ties break by arrival order, so a pop paints
-                        // the arriving list over the conversation that is still
-                        // sliding off it.
-                        targetContentZIndex = targetState.depth().toFloat(),
-                        // Both panes fill the window, so there is no size to
-                        // animate — and the default would spring the container
-                        // and clip whichever pane is mid-slide.
-                        sizeTransform = null,
-                    )
+    rememberTransition(paneState, label = "pane").AnimatedContent(
+        transitionSpec = {
+            // Going deeper slides the new pane over what was there; coming back
+            // slides it off and eases the pane underneath in from a slight
+            // parallax, so the two directions do not look like the same push
+            // twice.
+            val deeper = targetState.depth() > initialState.depth()
+            ContentTransform(
+                targetContentEnter = slideInHorizontally(paneSpec()) {
+                    if (deeper) it else -it / PANE_PARALLAX
                 },
-            ) { shown ->
-                // Nothing fades: a pane that thins out on its way past shows the
-                // window behind it. Depth is carried by the one underneath going
-                // dark instead, which is also what stops the parallax from
-                // looking like two unrelated things moving at once.
-                //
-                // Whichever of the two panes is shallower is the covered one, in
-                // both directions — a push and a pop differ only in which of
-                // them is the one arriving.
-                val covered = shown.depth() <
-                    maxOf(paneState.currentState.depth(), paneState.targetState.depth())
-                val onScreen by transition.animateFloat(
-                    transitionSpec = { paneSpec() },
-                    label = "onScreen",
-                ) { if (it == EnterExitState.Visible) 1f else 0f }
+                initialContentExit = slideOutHorizontally(paneSpec()) {
+                    if (deeper) -it / PANE_PARALLAX else it
+                },
+                // Depth alone decides what draws on top, which holds in both
+                // directions because each pane keeps the z-index it entered
+                // under.  Left at the default every pane sits at zero and ties
+                // break by arrival order, so a pop paints the arriving list over
+                // the conversation that is still sliding off it.
+                targetContentZIndex = targetState.depth().toFloat(),
+                // Both panes fill the same box, so there is no size to animate —
+                // and the default would spring the container and clip whichever
+                // pane is mid-slide.
+                sizeTransform = null,
+            )
+        },
+    ) { shown ->
+        // Nothing fades: a pane that thins out on its way past shows whatever is
+        // behind it. Depth is carried by the one underneath going dark instead,
+        // which is also what stops the parallax from looking like two unrelated
+        // things moving at once.
+        //
+        // Whichever of the two panes is shallower is the covered one, in both
+        // directions — a push and a pop differ only in which of them is the one
+        // arriving.
+        val covered = shown.depth() <
+            maxOf(paneState.currentState.depth(), paneState.targetState.depth())
+        val onScreen by transition.animateFloat(
+            transitionSpec = { paneSpec() },
+            label = "onScreen",
+        ) { if (it == EnterExitState.Visible) 1f else 0f }
 
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        // Read in the draw lambda, so scrubbing the dim costs a
-                        // redraw rather than a recomposition of the whole pane.
-                        .drawWithContent {
-                            drawContent()
-                            if (covered) {
-                                drawRect(Color.Black, alpha = (1f - onScreen) * PANE_DIM)
-                            }
-                        }
-                ) {
-                    if (shown != null) detailPane(shown, false) else listPane(Modifier)
+        Box(
+            Modifier
+                .fillMaxSize()
+                // The dim below darkens whatever the pane drew, so the pane has
+                // to have drawn something.  Every pane here is an opaque
+                // Scaffold except the empty state, which is a bare Box — over
+                // that, the black went straight onto the window and read as a
+                // shadow sliding about rather than a surface in shade.
+                .background(MaterialTheme.colorScheme.background)
+                // Read in the draw lambda, so scrubbing the dim costs a redraw
+                // rather than a recomposition of the whole pane.
+                .drawWithContent {
+                    drawContent()
+                    if (covered) {
+                        drawRect(Color.Black, alpha = (1f - onScreen) * PANE_DIM)
+                    }
                 }
-            }
+        ) {
+            content(shown)
         }
     }
 }

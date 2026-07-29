@@ -32,6 +32,17 @@ val OnSurfaceVariant = Color(0xFFC1C9BF)
 val Outline = Color(0xFF8B938A)
 val OutlineVariant = Color(0xFF414941)
 
+/**
+ * Links, in message text.
+ *
+ * Pale for a blue, because it has to clear 4.5:1 against the *sent* bubble as
+ * well as the received one — `GreenContainer` is much lighter than the chat
+ * background, and a saturated blue that looks right on the darker surface only
+ * reaches about 4.3:1 on the green one.  This lands at 5.5:1 there and 10:1 on
+ * received.
+ */
+val LinkBlue = Color(0xFFB0D2FF)
+
 val ErrorRed = Color(0xFFFFB4AB)
 val ErrorContainer = Color(0xFF93000A)
 val OnErrorContainer = Color(0xFFFFDAD6)

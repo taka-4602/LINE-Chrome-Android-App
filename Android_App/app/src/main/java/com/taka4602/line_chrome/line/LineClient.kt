@@ -59,16 +59,19 @@ class LineClient(
         /**
          * Long-poll routes to try, confirmed-working first.
          *
-         * `/P3 fetchOperations` is the one that actually delivers on a
-         * DESKTOPWIN session — established by running this probe against a live
-         * account.  The rest are kept as fallbacks and because their answers
-         * are useful diagnostics if LINE moves things again:
-         *  - `/P5 fetchOps` is what CHRLINE uses, but it replies in
-         *    TMoreCompact, which this port has no decoder for.
-         *  - `/P4 fetchOps` is what the Python client uses; the server rejects
-         *    it outright with `invalid method name`.
+         * `sync` is what this account's server actually serves; the three
+         * `fetch*` names below are rejected outright by every endpoint that
+         * answers at all ("Invalid method name"), and `/P3` — which used to win
+         * this list — replies HTTP 200 with a zero-byte body to anything.
+         *
+         * The legacy names are kept behind `sync` rather than deleted because
+         * they cost one bounded request each only when `sync` has already
+         * failed, and an older account may still be served by them.
          */
         val POLL_CANDIDATES = listOf(
+            "/P4" to "sync",
+            "/SYNC4" to "sync",
+            "/S4" to "sync",
             "/P3" to "fetchOperations",
             "/P4" to "fetchOperations",
             "/P5" to "fetchOps",
@@ -263,10 +266,27 @@ class LineClient(
         }
     }
 
+    /**
+     * The operations out of a poll reply, whichever method produced it.
+     *
+     * `fetchOps` and `fetchOperations` answer with a bare list, which the
+     * decoder keys at 0.  `sync` answers with a struct — operations at field 1,
+     * a has-more flag at 2, and a per-op-type delivery policy at 3 — and the
+     * decoder keys *that* at 1.  Reading only key 0, as this did, turned every
+     * sync reply into an empty list without any error: the poll then looked
+     * healthy and silently delivered nothing.
+     */
+    private fun operationsIn(result: Map<Int, Any?>): List<Any?> {
+        (result[0] as? List<Any?>)?.let { return it }
+        val sync = result[1] as? Map<*, *> ?: return emptyList()
+        return sync[1] as? List<Any?> ?: emptyList()
+    }
+
     private fun postPoll(
         endpoint: String,
         data: ByteArray,
         http: OkHttpClient = pollHttp,
+        strict: Boolean = false,
     ): List<Any?> {
         val req = Request.Builder()
             .url(HOST_GW + endpoint)
@@ -297,7 +317,15 @@ class LineClient(
                     raw.decodeToString().take(200)
             )
         }
-        if (raw.isEmpty()) return emptyList()
+        // An empty body is not a quiet account, it is a route that is not
+        // serving this method at all — `/P3` answers every request that way.
+        // Under [strict] say so, because the probe is choosing a route on the
+        // strength of this answer and "no operations" is indistinguishable from
+        // "working but idle" once it has been flattened to a list.
+        if (raw.isEmpty()) {
+            if (strict) throw LineTransportError("poll HTTP $code with an empty body")
+            return emptyList()
+        }
 
         val result = try {
             unpackCompact(raw)
@@ -309,8 +337,7 @@ class LineClient(
                     "(head=${raw.take(16).joinToString("") { "%02x".format(it) }}): ${e.message}"
             )
         }
-        // fetchOps returns a bare list, which the decoder keys at 0.
-        return result[0] as? List<Any?> ?: emptyList()
+        return operationsIn(result)
     }
 
     // -- token management --------------------------------------------------
@@ -985,6 +1012,42 @@ class LineClient(
         callTalk("unsendMessage", fields { str(2, messageId) })
     }
 
+    /**
+     * How far each member has read, for each of [chatMids].
+     *
+     * The counterpart to the `NOTIFIED_READ_MESSAGE` operations: those only say
+     * what has happened since the poll started, so without this a restart loses
+     * every read mark the account has ever accumulated.
+     *
+     * `chatIds` is field **2**, not 1 — the server names the argument in its
+     * error but not the id, and 1, 3, 4 and 5 all still report it missing.
+     *
+     * A member's entry is a *list* of ranges rather than one mark, because
+     * reading is not always one contiguous run.  The furthest end wins: read is
+     * cumulative, so the highest message id anyone has reached is how far they
+     * have got, whatever shape the ranges came in.
+     *
+     * @return chatMid -> (memberMid -> newest message id that member has read)
+     */
+    fun getMessageReadRange(chatMids: List<String>): Map<String, Map<String, String>> {
+        val targets = sanitizeMids(chatMids, "getMessageReadRange")
+        if (targets.isEmpty()) return emptyMap()
+        return batched(targets, "getMessageReadRange") { batch ->
+            val res = callTalk("getMessageReadRange", fields { strList(2, batch) })
+            tList(res, 0).mapNotNull { entry ->
+                val d = entry as? Map<*, *> ?: return@mapNotNull null
+                val chatMid = tStr(d, 1) ?: return@mapNotNull null
+                val marks = tMap(d, 2).mapNotNull { (mid, ranges) ->
+                    val who = mid as? String ?: return@mapNotNull null
+                    val furthest = tList(ranges).mapNotNull { tLong(it, 2) }.maxOrNull()
+                        ?: return@mapNotNull null
+                    who to furthest.toString()
+                }.toMap()
+                if (marks.isEmpty()) null else chatMid to marks
+            }
+        }.toMap()
+    }
+
     fun sendReadReceipt(chatMid: String, lastMessageId: String) {
         callTalk("sendChatChecked", fields {
             i32(1, nextReqId()); str(2, chatMid); str(3, lastMessageId)
@@ -1038,13 +1101,21 @@ class LineClient(
         pollProven = false
     }
 
-    private fun pollRequest(method: String, count: Int): ByteArray = when (method) {
-        "fetchOps" -> packCompact(method, fields {
-            i64(2, revision); i32(3, count); i64(4, globalRev); i64(5, individualRev)
-        })
-        // The older signature takes a 32-bit revision and nothing else.
-        else -> packCompact(method, fields { i32(2, revision.toInt()); i32(3, count) })
-    }
+    private fun pollRequest(method: String, count: Int, rev: Long = revision): ByteArray =
+        when (method) {
+            // sync takes one request struct rather than loose arguments; sent
+            // flat it answers "request is null".
+            "sync" -> packCompact(method, fields {
+                struct(1) {
+                    i64(1, rev); i32(2, count); i64(3, globalRev); i64(4, individualRev)
+                }
+            })
+            "fetchOps" -> packCompact(method, fields {
+                i64(2, rev); i32(3, count); i64(4, globalRev); i64(5, individualRev)
+            })
+            // The older signature takes a 32-bit revision and nothing else.
+            else -> packCompact(method, fields { i32(2, rev.toInt()); i32(3, count) })
+        }
 
     /**
      * Find the endpoint and method this account's server serves the long-poll on.
@@ -1059,6 +1130,13 @@ class LineClient(
      * A candidate that returns TMoreCompact instead of TCompact fails to decode
      * and is reported with the leading bytes of its response, which is the
      * evidence needed to add that decoder.
+     *
+     * A candidate has to *answer*, not merely fail to throw.  `/P3` replies
+     * HTTP 200 with a zero-byte body to every method it is offered, and on the
+     * old "answering at all is enough" rule it won this list and then delivered
+     * nothing for the life of the session — while the connection reported
+     * itself Live, because an empty reply and an idle account were the same
+     * value by the time the probe saw them.  Hence `strict`.
      */
     private fun probePollRoute(count: Int): Pair<PollRoute, List<Any?>> {
         val notes = mutableListOf<String>()
@@ -1067,11 +1145,7 @@ class LineClient(
             try {
                 // Bounded, so one endpoint that accepts the request and then
                 // sits on it cannot hold up the candidates behind it.
-                val ops = postPoll(endpoint, pollRequest(method, count), probeHttp)
-                // Answering at all is enough.  An empty answer is what a quiet
-                // account looks like, and the service has its own safety net
-                // regardless, so there is nothing here worth reporting as a
-                // fault.
+                val ops = postPoll(endpoint, pollRequest(method, count), probeHttp, strict = true)
                 pollDiagnostics = ""
                 Log.i(TAG, "poll route resolved: $route (${ops.size} ops)")
                 return route to ops
