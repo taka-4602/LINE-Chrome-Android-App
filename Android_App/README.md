@@ -20,14 +20,18 @@ Dark theme only. `minSdk` 24, `targetSdk` 36, Material 3.
 | Conversation view, send / receive text | working |
 | Reply (long-press or double-tap) | working |
 | Copy / share a message | working |
-| Read receipts | manual only — never sent automatically |
-| Stickers | received and rendered from the sticker CDN; sending not implemented |
-| Send images and video | working, unsealed chats only — see [Known limits](#known-limits) |
+| Read receipts — sending | manual only — never sent automatically |
+| Read receipts — “Read” / “Read N” on your own messages | working, and restored on opening a chat |
+| Links in messages | detected, blue, tap opens the default browser |
+| Stickers | rendered from the sticker CDN |
+| Send images and video | working, unsealed chats only |
 | Receive images and video, sealed **and** unsealed | working, with thumbnails |
 | Receive audio and files | labelled `[Audio]` / `[File]`; not downloaded |
 | E2EE 1:1 — encrypt **and** decrypt | working |
-| E2EE group — encrypt **and** decrypt | working, see [Letter sealing](#letter-sealing) |
+| E2EE group — decrypt | working |
+| E2EE group — encrypt | working, except in a group that has never been sealed — see [Known limits](#known-limits) |
 | Background polling + notifications | working, see [Message delivery](#message-delivery) |
+| Adjustable poll cadences | **Settings → Polling**, all seven; 0 turns a loop off |
 | Messages that arrived while the app was dead | delivered on next start |
 | Foldable / tablet two-pane layout | working |
 | Light theme | deliberately absent |
@@ -46,6 +50,7 @@ line/            protocol layer — a direct port of the Python client
   E2eeStore.kt     on-disk key material, same layout as the Python client
 data/            LineRepository (single source of UI state)
                  SessionStore (tokens) + CredentialStore (keystore-encrypted)
+                 PollingSettings (the poll cadences, user-overridable)
 service/         PollingService (foreground) + Notifier
 ui/              Compose screens, dark-only Material 3 theme
 ```
@@ -53,6 +58,23 @@ ui/              Compose screens, dark-only Material 3 theme
 `LineRepository` is a process-wide singleton because the polling service and the
 Activity have to share one message store, and a session can cost a PIN
 confirmation to rebuild.
+
+### Why the theme provides a content colour
+
+`LineChromeTheme` provides `LocalContentColor` explicitly. That looks redundant
+next to a colour scheme that already names `onBackground`, and it is not:
+material3 defaults `LocalContentColor` to **black** and expects a `Surface` to
+have replaced it. A bare `MaterialTheme` never does.
+
+Text that names its own colour is unaffected, and so is text inside a `Scaffold`,
+an app bar or a `Surface`, since those provide one. Everything else was drawing
+black on a near-black background — "Nothing open" measured 0 against a
+background of 17, about 1.1:1, and most of the **Settings** labels were doing
+the same.
+
+It is provided here rather than by wrapping the app in a `Surface`, which would
+also add a background draw and another pointer-input participant beneath
+everything when the only defect is the colour.
 
 ### Why BouncyCastle
 
@@ -131,6 +153,60 @@ folding, unfolding and rotating all recreate the Activity. Losing the open
 conversation on every fold would be miserable, and deriving the name and picture
 from the MID means they stay current if a contact is renamed.
 
+### Back navigation
+
+Back unwinds one layer at a time — media viewer, then profile, then
+conversation, then the app — and each layer is a **predictive back** gesture:
+drag from the edge and the surface shrinks and slides toward the swipe before
+you commit, so you can see what letting go will do and cancel by dragging back.
+
+This is `SeekablePanes` in `ui/AppRoot.kt`. Seekable rather than
+fire-and-forget: the transition a tap plays through is the same one the gesture
+drives by hand, so letting go part-way rewinds it rather than having to jump.
+
+**Both layouts use it.** Stacked, the pane covers the window and the thing
+underneath is the list. Side by side the list stays put and the gesture is
+scoped to the detail pane alone — the conversation slides off toward the right
+edge and the empty state comes up underneath it, or the conversation a profile
+was opened from does. The surface leaving is smaller, but it leaves in the same
+direction, so back feels the same whichever way the device is open.
+
+That is a change: the two-pane layout used to take a plain `BackHandler` on the
+grounds that with both panes on screen there was nothing to reveal. There is —
+clearing a conversation reveals the empty state, and closing a profile reveals
+the conversation.
+
+Two things that only matter once the pane is narrower than the window, and both
+showed up as the same symptom — a dark band drifting across the conversation
+list:
+
+- A sliding pane is **translated, not resized**, so it draws outside its own
+  box. Full-screen that spill leaves the display and nobody sees it; in a pane
+  it lands on the list. Hence `clipToBounds` on the detail pane.
+- The dim darkens whatever the covered pane drew, which assumes it drew
+  something. Every pane is an opaque `Scaffold` except the empty state, which is
+  a bare `Box` — over that the black went straight onto the window. Hence the
+  background on the pane container.
+
+The awkward part is version behaviour, and it is worth being precise about.
+`targetSdk` 36 turns predictive back on by default — but only on Android 16, so
+the manifest opts in explicitly to get it on 13 through 15 as well. The
+attribute is ignored below API 33, and `PredictiveBackHandler` itself carries no
+`@RequiresApi`, so `minSdk` 24 is unaffected: where the platform has no
+predictive back the progress flow simply emits nothing and completes on a plain
+back press.
+
+That last detail dictates how the handler is written. **The commit runs after
+the collect, never from a progress threshold** — a threshold would never be
+reached on a device that emits no progress, and back would stop working
+entirely. Cancellation arrives as a `CancellationException` from the flow, which
+is the gesture being released rather than the job dying, so it is caught and
+used to settle the surface back to rest.
+
+Opting in also means `onBackPressed()` is no longer called and `KEYCODE_BACK` is
+no longer dispatched. Neither is used here — back has always gone through
+`OnBackPressedDispatcher` — so there was nothing to migrate.
+
 ## Profiles
 
 Tapping the name and picture at the top of a conversation opens a profile page:
@@ -167,35 +243,128 @@ as wanting them to know you read it — so `sendChatChecked` only goes out when 
 The ✓✓ button in the Chats tab clears **every** badge, also without telling LINE
 anything.
 
+### “Read” on your own messages
+
+Receiving is separate from sending, and not conditional on it: LINE pushes
+`NOTIFIED_READ_MESSAGE` whether or not you ever send a receipt of your own, so
+the ✓-button policy above costs you nothing here. Your messages show **Read** in
+a 1:1 and **Read N** in a group, N being how many people have read that far —
+LINE's 既読 and 既読N, in the language the rest of this app speaks.
+
+A receipt is cumulative — one mark per reader, meaning "read up to here" — so
+`_readReceipts` holds one entry per reader rather than one per message, and the
+per-bubble count is worked back out in `readCounts`. That comparison is numeric
+on the message id, not positional in the loaded list, because a mark often falls
+outside the window: a reader further ahead than anything on screen still counts
+for all of it, and one still behind the top counts for none. A mark that is not
+a number cannot be placed either way and is dropped, which shows no label rather
+than one on the wrong message.
+
+Two things do not count: your own other devices reading the chat, and
+`SEND_CHAT_CHECKED` echoing your own ✓ back at you.
+
+### Where the marks come from
+
+Two sources, merged by `mergeReadMarks`, newest mark always winning so neither
+can drag a message back to unread:
+
+- **live** — `NOTIFIED_READ_MESSAGE` off the poll, as people read;
+- **backfill** — `getMessageReadRange`, on opening a chat.
+
+The backfill is what makes the label survive a restart. Operations only report reads
+that happen while the poll is running, so without it every mark vanished when
+the app closed and did not return until somebody read something new — which,
+since the poll seeds at the current revision, meant it was effectively never
+visible.
+
+`getMessageReadRange` takes `chatIds` at field **2** — the server names the
+argument in its error but not the id, and 1, 3, 4 and 5 all still report it
+missing. It answers per chat with a map of member to a *list* of ranges, each
+`{1: startMessageId, 2: endMessageId, …}`. The furthest `endMessageId` wins:
+reading is not always one contiguous run, but it is cumulative, so the highest
+id anyone reached is how far they have got.
+
+It runs alongside the message fetch rather than after it, so the label appears a
+moment behind the bubbles instead of delaying them, and a failure is logged and
+swallowed — the chat is readable either way.
+
+### The soft spot
+
+The third param of op 55 is meant to be the message id read up to. Observed in
+a 1:1, where the first two params are both the other party:
+
+```
+p1=u9ac1f48…  p2=u9ac1f48…  p3=624950626019180681
+```
+
+But LINE has shipped that param empty and non-numeric depending on the client
+the receipt came from. Anything unusable falls back to the newest message held
+for that chat — which is what a bare receipt means in practice — and logs what
+it actually saw, so a version that behaves differently shows up in logcat
+rather than silently miscounting.
+
+Only the 1:1 shape has been observed directly. A group receipt is expected to
+name the group in `p1` and the reader in `p2`, and the code is written for that,
+but it has not been caught in the act.
+
+## Links
+
+A URL in a message is blue and underlined, and tapping it opens the default
+browser. Underlined as well as blue, because colour alone is not something
+everyone can distinguish.
+
+Detection is in `ui/components/Links.kt`, plain Kotlin with no Android
+dependency — `android.util.Patterns.WEB_URL` is the obvious tool and is a
+framework class that unit tests only see as a stub, and this is exactly the sort
+of thing that wants tests.
+
+Only `http://`, `https://` and bare `www.` are matched. **Bare domains are
+not**: linking `example.com` means deciding that `Node.js`, `3.5` and
+`README.md` are not domains, and a wrong guess turns an ordinary word blue and
+sends you to a browser you did not ask for. Trailing punctuation is trimmed —
+including `。` and `」`, which a Japanese sentence wraps a link in and `\S+`
+swallows whole — while a bracket the URL itself opened is kept, so
+`..._(planet)` survives.
+
+### Why not LinkAnnotation
+
+`LinkAnnotation.Url` is the built-in answer and brings its own tap handling. It
+also *consumes the gesture*, and on a message that is nothing but a URL — which
+is most links people send — the whole bubble becomes link, so long-press and
+double-tap stop reaching it. Reply, Copy and Share would be unreachable on
+exactly the messages most worth sharing. Verified on device before it was
+abandoned: long-pressing a link opened Chrome instead of the menu.
+
+So `LinkableText` styles the spans itself and owns all three gestures, resolving
+a tap against the text layout to decide whether a URL was hit. A tap that misses
+one does nothing, which is what tapping a message did before. The bubble keeps
+its own `combinedClickable` for the padding around the text, which the text's
+handler does not cover.
+
+The cost is accessibility: these links are not announced as links by TalkBack,
+which `LinkAnnotation` would have given for free.
+
 ## Letter sealing
 
-Whether a chat is sealed is the **recipient's** setting, not something the
-sender can see up front, so a text send goes out plain and is re-sent encrypted
-if the server answers `E2EE_RETRY_ENCRYPT` (82) — which is what LINE's own
-clients do. Passing `e2ee = true` skips straight to the encrypted path.
+Whether a chat is sealed is the *recipient's* setting and is not knowable up
+front, so text goes out plain and is re-sent encrypted if the server answers
+`E2EE_RETRY_ENCRYPT` (82). That is what LINE's own clients do.
 
-1:1 and group chats seal differently:
+1:1 derives a fresh secret per message: ECDH between our private key and the
+peer's current public key, salted, AES-256-GCM with a 16-byte nonce.
 
-| | Key agreement | Version |
-|---|---|---|
-| 1:1 | pairwise ECDH — our private half against the peer's public half from `negotiateE2EEPublicKey` | whatever the negotiate call reports |
-| group | one shared key pair for the whole group; the group's **private** half against our own public half | always 2 — the shared key fixes it |
+Groups do not do this pairwise. The creator generates **one** key pair for the
+group and hands each member a copy of the private half, wrapped with
+ECDH(creator, member) — and, unlike message keys, with **no salt** in that
+wrapping. Sending then pairs the group's private half with our *own* public half,
+which is the same secret every member derives. `specVersion` is fixed at 2 rather
+than negotiated, because there is no single peer to negotiate with.
 
-A sealed group does no pairwise ECDH at all. The creator generates a single key
-pair and hands every member an encrypted copy of the private half, wrapped with
-ECDH(member key, creator key); `getLastE2EEGroupSharedKey` returns our copy and
-`groupSharedKey` unwraps it. Every member therefore derives the same secret,
-which is also why the same code path decrypts our own group messages.
-
-The version travels in `contentMetadata` as `e2eeVersion` rather than being
-assumed, because the recipient rebuilds the GCM AAD from it. Signing with one
-version while advertising another makes their tag check fail, and the message
-then shows as undecryptable on every device except the one that sent it.
-
-Group keys rotate whenever the membership changes, and the only signal that ours
-is stale is being refused with it — `[code=99] old group key`. There is nothing
-to check in advance, so a refusal drops the cached key, refetches, and retries
-once. Keys are cached in memory and under `.e2eeGroupKeys`, keyed by group MID.
+The part worth knowing: **a group rotates its key whenever the membership
+changes**, and there is no notification — the only way to learn our copy is stale
+is to be refused with it, as `[code=99] old group key`. A cached key is therefore
+dropped and refetched on that error and the send retried once, so a message into
+a group somebody just joined or left goes through instead of failing.
 
 ## Media
 
@@ -270,6 +439,9 @@ noise and says nothing about why.
 
 ## Message delivery
 
+> Full write-up in [`POLLING.md`](POLLING.md) — the three delivery paths, route
+> probing, long- vs short-poll detection, and every cadence with its bounds.
+
 There is no push channel — LINE delivers through its own app, not ours — so the
 client polls in a foreground service. That is why there is a permanent
 low-priority "Connection" notification; Android will not keep a long-lived socket
@@ -304,6 +476,9 @@ clear of the request rate that
 [gets accounts banned](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1).
 A 2s floor applies either way, so no endpoint can make the loop spin.
 
+Every interval quoted from here on is a **default**, not a constant — see
+[Tuning the cadences](#tuning-the-cadences).
+
 ### The safety net
 
 Delivery does not depend on any of that working. A poll with nothing to say and
@@ -323,7 +498,10 @@ so a naive per-chat sweep on a timer would not be safe.
 
 On top of that, the conversation on screen is re-fetched every 3s. It costs one
 request and stops the moment the app is backgrounded, so it buys fresher messages
-where they are being read without adding steady background load.
+where they are being read without adding steady background load. (Internally this
+is `watchOpenChat` and Settings calls it the *on-screen chat refresh* — "open" as
+in the chat you have open, nothing to do with LINE's OpenChat, which this client
+does not implement.)
 
 **Settings → Connection** shows when the safety net last ran, which is the
 quickest way to tell whether background delivery is alive.
@@ -359,6 +537,47 @@ button. So does logcat:
 adb logcat -s PollingService:* LineClient:*
 ```
 
+### Tuning the cadences
+
+Every interval above is a default rather than a constant. **Settings → Polling**
+lists all seven and each is editable; the loops read their value once per tick,
+so an edit applies on the next one without restarting the service or reopening a
+chat.
+
+| Setting | Default | Range | 0 means |
+|---|---|---|---|
+| Long-poll floor | 2s | 1–60s | **off** — no long-poll at all |
+| Short-poll interval | 5s | 2–300s | **off** — an endpoint that turns out to answer instantly is dropped for the fallback rather than short-polled |
+| Fallback check | 10s | 5–600s | **off** — a failing poll is left to the safety net |
+| Fallback session length | 10 min | 1–60 min | **one check**, then re-probe |
+| Safety-net check | 25s | 10–600s | **off** |
+| Safety-net quiet period | 60s | 10s–60 min | **never skip** |
+| On-screen chat refresh | 3s | 1–120s | **off** |
+
+Zero is accepted everywhere but does not mean the same thing everywhere, and
+this is the part worth reading twice. For the five that drive requests it is an
+off switch. The other two are *waits*, not cadences — a fallback session is how
+long to **stay** on the fallback before re-probing, a quiet period is how
+recently the poll must have delivered before the net skips a tick — so zero
+there means "do not wait", which is **more** polling, not less.
+
+Three of them are delivery paths: the long-poll floor, the fallback check and
+the safety-net check. Turn all three off and there is nothing left to run, so
+the foreground service stops and its notification goes with it; **Settings →
+Connection** then reads "Polling turned off in Settings" and nothing arrives at
+all until one of the three goes back above 0, which starts it again. Settings
+says so in a red card rather than letting you discover it by missing messages.
+
+One floor is deliberately not settable. With the long-poll on but the fallback
+off, nothing is left to pace the outer loop, so re-probing the candidate list is
+held to 30s — a route that fails fast would otherwise spin.
+
+The defaults are the values the rest of this section describes and sit well
+clear of the request rate that
+[gets accounts banned](https://github.com/DeachSword/LINE-DemoS-Bot/issues/1).
+Lowering them is the direction to be careful in: there is no warning before a
+restriction, and no way to appeal one on an account using an unofficial client.
+
 ### Notifications
 
 One notification per chat, `MessagingStyle`, so a busy conversation stacks its
@@ -375,9 +594,11 @@ re-alerts rather than stacking — one notification that made the sound twice.
 
 ### Stopping it
 
-**Quit app**, at the bottom of Settings, stops the service and exits. It is the
-only way to put the connection down without signing out, because Android does not
-let you dismiss a foreground service notification.
+**Quit app**, at the bottom of Settings, stops the service and exits. Android
+does not let you dismiss a foreground service notification, so short of signing
+out this and setting all three delivery paths to 0 are the two ways to put the
+connection down — the difference being that Quit also closes the app, while a
+zeroed poll leaves it running and receiving nothing.
 
 `PollingService.stop` goes through `stopService` rather than delivering itself an
 intent: that clears the started state at the framework, so `START_STICKY` does
@@ -449,23 +670,16 @@ Found here, and worth fixing in the Python client too:
 Inherited from the Python client, and documented at more length in
 [`LINE_Chrome_Python/README.md`](LINE_Chrome_Python/README.md):
 
-- **Media in a sealed chat is receive-only.** A sealed chat rejects a plain
-  upload exactly as it rejects plain text, and the encrypted-upload flow —
-  encrypting the file, then recording the namespace, object id and key material
-  in `contentMetadata` — is not implemented either side. Sealed images and video
-  sent from other clients are downloaded and decrypted normally; only sending
-  into a sealed chat is limited to text. Text itself, 1:1 and group, is fine —
-  see [Letter sealing](#letter-sealing).
+- **A group that has never been sealed cannot be sealed by this client.** Sending
+  into an already-sealed group works; *creating* the first group key needs
+  `registerE2EEGroupKey`, which neither client implements. The signal is error
+  code 5 from `getLastE2EEGroupSharedKey` — no key exists to fetch.
 - Messages this client sends may show "can't be decrypted" on your other devices.
   It signs with the key id lifted from the key chain rather than registering its
   own via `registerE2EEPublicKey`. Not fully diagnosed.
-- Peer key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's
-  current key, so 1:1 messages predating a rotation stay unreadable. Keys are
-  cached by key id to limit future loss; they cannot be recovered retroactively.
-  Group keys are the same story and slightly worse: `getLastE2EEGroupSharedKey`
-  takes a group MID and a key version but no key id, so it only ever answers with
-  the current key, and the on-disk copy holds one key per group. Messages sealed
-  before a membership change are unreadable once the group has rotated.
+- Key rotation is one-way: `negotiateE2EEPublicKey` returns only a peer's current
+  key, so messages predating a rotation stay unreadable. Keys are cached to limit
+  future loss; they cannot be recovered retroactively.
 - The chat list costs one `getRecentMessagesV2` per chat, eight at a time, since
   LINE has no call that returns it directly. Fine for tens of chats, slow for
   hundreds.
