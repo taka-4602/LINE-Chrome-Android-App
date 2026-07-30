@@ -18,6 +18,7 @@ import com.taka4602.line_chrome.line.Message
 import com.taka4602.line_chrome.line.OpType
 import com.taka4602.line_chrome.line.Operation
 import com.taka4602.line_chrome.line.Profile
+import com.taka4602.line_chrome.line.isSessionDead
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -319,10 +320,6 @@ object LineRepository {
     private var lastRecoveryAt = 0L
     private var lastRecoveryOk = false
     private var reloginJob: Job? = null
-
-    /** LINE's V3_TOKEN_CLIENT_LOGGED_OUT — the session is gone, not the request. */
-    private val LineServiceError.isSessionDead: Boolean
-        get() = code == 8 || message.contains("LOGGED_OUT") || message.contains("V3_TOKEN")
 
     /**
      * Whether a failed re-login is worth repeating.

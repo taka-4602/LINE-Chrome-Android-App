@@ -1151,6 +1151,13 @@ class LineClient(
      * and is reported with the leading bytes of its response, which is the
      * evidence needed to add that decoder.
      *
+     * A rejected token is not a verdict on the candidate and stops the list at
+     * once.  Every route answers a dead session the same way, so carrying on
+     * turns one expired token into seven rejected requests and — worse — buries
+     * the reason under the four rejections the trailing legacy candidates always
+     * produce, leaving the caller a [LineTransportError] it reads as "no route"
+     * when the route was fine and only the token was not.
+     *
      * A candidate has to *answer*, not merely fail to throw.  `/P3` replies
      * HTTP 200 with a zero-byte body to every method it is offered, and on the
      * old "answering at all is enough" rule it won this list and then delivered
@@ -1169,6 +1176,13 @@ class LineClient(
                 pollDiagnostics = ""
                 Log.i(TAG, "poll route resolved: $route (${ops.size} ops)")
                 return route to ops
+            } catch (e: LineServiceError) {
+                if (e.isSessionDead) {
+                    Log.i(TAG, "poll probe stopped at $route: session is dead")
+                    throw e
+                }
+                notes += "$route -> ${e.message.take(100)}"
+                Log.w(TAG, "poll candidate $route rejected: ${e.message}")
             } catch (e: Exception) {
                 notes += "$route -> ${e.message?.take(100)}"
                 Log.w(TAG, "poll candidate $route rejected: ${e.message}")

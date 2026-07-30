@@ -290,6 +290,17 @@ class LineServiceError(val code: Int, override val message: String) : Exception(
     override fun toString() = "[code=$code] $message"
 }
 
+/**
+ * LINE's V3_TOKEN_CLIENT_LOGGED_OUT — the session is gone, not the request.
+ *
+ * Lives with the error rather than with either caller because both the
+ * transport and the repository have to tell this apart from a request that
+ * merely failed: the transport must stop retrying, and the repository must
+ * re-login instead of reporting a fault.
+ */
+val LineServiceError.isSessionDead: Boolean
+    get() = code == 8 || message.contains("LOGGED_OUT") || message.contains("V3_TOKEN")
+
 private fun makeLineError(fields: Any?): LineServiceError {
     val m = fields as? Map<*, *> ?: return LineServiceError(0, fields.toString())
     val code = (m[1] as? Number)?.toInt() ?: 0
