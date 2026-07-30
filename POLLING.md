@@ -224,6 +224,16 @@ the ban threshold, not against latency.
 Dropping to the fallback here would be pointless — it would fail exactly the
 same way, for the same reason.
 
+That test is on the exception's *type*, which is why `probePollRoute` rethrows a
+session-dead error instead of noting it as a rejection. A token expiring while
+the route is still unresolved otherwise ends the probe as a `LineTransportError`
+reading `no working poll route. /P4 sync -> V3_TOKEN_CLIENT_LOGGED_OUT | … |
+/P4 fetchOps -> Invalid method name`, and the wrong type sends a recoverable
+session to the fallback for ten minutes of TalkService calls carrying the same
+expired token — then back round to the same probe, indefinitely. `isSessionDead`
+lives beside `LineServiceError` in `Thrift.kt` so both layers ask the one
+question the same way.
+
 Otherwise `fallbackSession` takes over: plain TalkService refreshes every 10s for
 10 minutes, then return so the long-poll gets another chance. Re-probing happens
 only on the way back round, deliberately *not* between every refresh — one hung
