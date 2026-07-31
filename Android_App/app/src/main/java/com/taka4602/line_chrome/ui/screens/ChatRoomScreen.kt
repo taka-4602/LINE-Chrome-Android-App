@@ -79,6 +79,7 @@ import com.taka4602.line_chrome.ui.components.MediaBubble
 import com.taka4602.line_chrome.ui.components.copyToClipboard
 import com.taka4602.line_chrome.ui.components.shareText
 import com.taka4602.line_chrome.ui.components.crossesDay
+import com.taka4602.line_chrome.ui.components.dayStamp
 import com.taka4602.line_chrome.ui.components.formatClock
 import com.taka4602.line_chrome.ui.components.formatDayLabel
 import com.taka4602.line_chrome.ui.components.LinkableText
@@ -236,7 +237,16 @@ fun ChatRoomScreen(
             itemsIndexedStable(messages) { index, msg ->
                 val previous = messages.getOrNull(index - 1)
                 val readBy = readCounts[msg.id] ?: 0
-                if (crossesDay(previous?.createdTime, msg.createdTime)) {
+                // The day to compare against is the last one we actually know,
+                // not whatever sits directly above: a message that arrived
+                // without a timestamp would otherwise read as a day boundary
+                // and push the separator down past the message it belongs to.
+                // Nearly always that is the message above, so the walk stops at
+                // the first step.
+                val previousDay = (index - 1 downTo 0).firstNotNullOfOrNull {
+                    dayStamp(messages[it].createdTime)
+                }
+                if (crossesDay(previousDay, msg.createdTime)) {
                     DaySeparator(formatDayLabel(msg.createdTime))
                 }
                 val mine = msg.sender == selfMid
@@ -277,6 +287,13 @@ fun ChatRoomScreen(
  * newest message at position 0.  That mapping is confined to here, so the
  * content lambda still gets the index a message actually has in [messages] —
  * oldest first — and can look back at the one before it.
+ *
+ * The [Column] is load-bearing, not tidiness.  Under `reverseLayout` a lazy
+ * list flips each of an item's placeables about the viewport independently, so
+ * an item that emits two of them gets them back in the opposite order — a day
+ * separator emitted above its message lands below it, filing the first message
+ * of a day under the previous one.  One placeable per item, laid out by a
+ * Column that `reverseLayout` does not reach into, keeps the order written.
  */
 private inline fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedStable(
     messages: List<Message>,
@@ -289,7 +306,7 @@ private inline fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedSt
     },
 ) { position ->
     val index = messages.lastIndex - position
-    content(index, messages[index])
+    Column(Modifier.fillMaxWidth()) { content(index, messages[index]) }
 }
 
 /**

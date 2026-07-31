@@ -1289,11 +1289,27 @@ object LineRepository {
         }
     }
 
+    /**
+     * Add a message that has just happened — a send we made, or one an
+     * operation delivered.
+     *
+     * LINE does not always fill in createdTime, and 0 is what it sends for
+     * "unset".  Left alone that message has no day: [merge] sorts it to the
+     * very top of the conversation, and the chat room cannot put it under a
+     * day separator, so the first message of a day ends up stranded above the
+     * "Today" label instead of under it.  We know when it arrived, because it
+     * arrived now, so say so rather than leaving it undated.
+     */
     private fun appendMessage(chatMid: String, msg: Message) {
         val existing = _messages.value[chatMid].orEmpty()
         if (msg.id != null && existing.any { it.id == msg.id }) return
-        _messages.value = _messages.value + (chatMid to (existing + msg))
-        bumpSummary(chatMid, msg)
+        val dated = if (msg.createdTime == null || msg.createdTime == 0L) {
+            msg.copy(createdTime = System.currentTimeMillis())
+        } else {
+            msg
+        }
+        _messages.value = _messages.value + (chatMid to (existing + dated))
+        bumpSummary(chatMid, dated)
     }
 
     private fun bumpSummary(chatMid: String, msg: Message) {

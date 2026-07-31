@@ -117,17 +117,27 @@ fun formatTimestamp(ms: Long?): String {
     }
 }
 
+/**
+ * A timestamp we can actually place on a calendar, or null.
+ *
+ * LINE leaves field 5 off some messages and sends 0 for "unset", and both mean
+ * the same thing — we do not know when this happened.  Reading 0 as a real
+ * instant puts the message in 1970, which is how a missing timestamp used to
+ * turn into a blank day separator.
+ */
+fun dayStamp(ms: Long?): Long? = ms?.takeIf { it != 0L }
+
 /** Clock time only — used on message bubbles, where the day is a separator. */
 fun formatClock(ms: Long?): String {
-    if (ms == null || ms == 0L) return ""
-    val c = Calendar.getInstance().apply { timeInMillis = ms }
+    val stamp = dayStamp(ms) ?: return ""
+    val c = Calendar.getInstance().apply { timeInMillis = stamp }
     return "%02d:%02d".format(c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
 }
 
 /** Day separator label inside a conversation. */
 fun formatDayLabel(ms: Long?): String {
-    if (ms == null || ms == 0L) return ""
-    val then = Calendar.getInstance().apply { timeInMillis = ms }
+    val stamp = dayStamp(ms) ?: return ""
+    val then = Calendar.getInstance().apply { timeInMillis = stamp }
     val now = Calendar.getInstance()
     val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
     return when {
@@ -139,12 +149,18 @@ fun formatDayLabel(ms: Long?): String {
     }
 }
 
-/** True when two timestamps fall on different calendar days. */
+/**
+ * True when two timestamps fall on different calendar days.
+ *
+ * A message with no usable timestamp opens no day of its own — it cannot be
+ * labelled, so a separator above it would be blank.  [previous] is the last
+ * timestamp we do know, not necessarily the one on the message just above.
+ */
 fun crossesDay(previous: Long?, current: Long?): Boolean {
-    if (current == null) return false
-    if (previous == null) return true
-    val a = Calendar.getInstance().apply { timeInMillis = previous }
-    val b = Calendar.getInstance().apply { timeInMillis = current }
+    val now = dayStamp(current) ?: return false
+    val before = dayStamp(previous) ?: return true
+    val a = Calendar.getInstance().apply { timeInMillis = before }
+    val b = Calendar.getInstance().apply { timeInMillis = now }
     return !a.sameDayAs(b)
 }
 
